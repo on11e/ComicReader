@@ -11,152 +11,224 @@ import java.io.File
 import java.io.FileOutputStream
 import java.util.zip.ZipFile
 
+data class ComicChapter(
+    val id: String,
+    val name: String,
+    val sourceUri: Uri,
+    val isZip: Boolean
+)
+
 data class ComicBook(
     val id: String,
     val name: String,
-    val isZip: Boolean,
     val uri: Uri,
-    val description: String
+    val description: String,
+    val chapters: List<ComicChapter>
 )
 
 object ComicParser {
 
-    // 扫描主目录，生成书架列表
     suspend fun scanBookshelf(context: Context, rootUri: Uri): List<ComicBook> = withContext(Dispatchers.IO) {
         val rootDir = DocumentFile.fromTreeUri(context, rootUri)
         if (rootDir == null || !rootDir.isDirectory) return@withContext emptyList()
 
         rootDir.listFiles()
-            .filter { file ->
-                file.isDirectory || (file.isFile && (file.name?.endsWith(".zip", true) == true || file.name?.endsWith(".cbz", true) == true))
-            }
-            .map { file ->
-                val isZip = file.isFile
-                ComicBook(
-                    id = file.uri.toString(),
-                    name = file.name ?: "未命名漫画",
-                    isZip = isZip,
-                    uri = file.uri,
-                    description = if (isZip) "本地压缩包 (ZIP)" else "本地文件夹"
-                )
-            }
-            .sortedBy { it.name }
+            .mapNotNull { entry -> buildBook(entry) }
+            .sortedBy { it.name.lowercase() }
     }
 
-    // ─── 工业级优化：加入永久缩略图磁盘缓存，消除白块与转圈 ───
-    suspend fun getBookCover(context: Context, book: ComicBook, cacheZipFile: File, coverIndex: Int): Any? = withContext(Dispatchers.IO) {
-        // 为每一本书的每一个封面页码生成一个唯一的、合法的安全文件名
-        val safeId = book.id.hashCode()
-        val diskCacheFile = File(context.filesDir, "thumb_${safeId}_v${coverIndex}.jpg")
+    private fun buildBook(entry: DocumentFile): ComicBook? {
+        if (entry.isFile && isArchiveFile(entry.name)) {
+            val chapterName = entry.name?.substringBeforeLast('.') ?: "第1话"
+            return ComicBook(
+                id = entry.uri.toString(),
+                name = chapterName,
+                uri = entry.uri,
+                description = "压缩包漫画",
+                chapters = listOf(
+                    ComicChapter(
+                        id = entry.uri.toString(),
+                        name = chapterName,
+                        sourceUri = entry.uri,
+                        isZip = true
+                    )
+                )
+            )
+        }
 
-        // 🎯 策略一：如果磁盘缓存存在，零延迟直接秒开本地缩略图
+        if (!entry.isDirectory) return null
+
+        val children = entry.listFiles()
+        val chapters = mutableListOf<ComicChapter>()
+        val hasDirectImages = children.any(::isImageFile)
+        val childChapterCandidates = children
+            .filter { child -> child.isDirectory || isArchiveFile(child.name) }
+            .sortedBy { it.name?.lowercase() ?: "" }
+
+        if (hasDirectImages) {
+            chapters += ComicChapter(
+                id = "${entry.uri}#root",
+                name = if (childChapterCandidates.isEmpty()) "正文" else "第1话",
+                sourceUri = entry.uri,
+                isZip = false
+            )
+        }
+
+        childChapterCandidates.forEachIndexed { index, child ->
+            buildChapter(child, index + if (hasDirectImages) 2 else 1)?.let(chapters::add)
+        }
+
+        if (chapters.isEmpty()) return null
+
+        return ComicBook(
+            id = entry.uri.toString(),
+            name = entry.name ?: "未命名漫画",
+            uri = entry.uri,
+            description = if (chapters.size > 1) "共 ${chapters.size} 章" else "单章漫画",
+            chapters = chapters
+        )
+    }
+
+    private fun buildChapter(entry: DocumentFile, fallbackIndex: Int): ComicChapter? {
+        if (entry.isFile && isArchiveFile(entry.name)) {
+            return ComicChapter(
+                id = entry.uri.toString(),
+                name = entry.name?.substringBeforeLast('.') ?: "第${fallbackIndex}话",
+                sourceUri = entry.uri,
+                isZip = true
+            )
+        }
+
+        if (!entry.isDirectory) return null
+        if (!entry.listFiles().any(::isImageFile)) return null
+
+        return ComicChapter(
+            id = entry.uri.toString(),
+            name = entry.name ?: "第${fallbackIndex}话",
+            sourceUri = entry.uri,
+            isZip = false
+        )
+    }
+
+    suspend fun getBookCover(context: Context, book: ComicBook, cacheZipFile: File, coverIndex: Int): Any? = withContext(Dispatchers.IO) {
+        val chapter = book.chapters.firstOrNull() ?: return@withContext null
+        val diskCacheFile = File(context.filesDir, "thumb_${book.id.hashCode()}_v${coverIndex}.jpg")
+
         if (diskCacheFile.exists() && diskCacheFile.length() > 0) {
             return@withContext diskCacheFile
         }
 
-        // 🎯 策略二：缓存不存在，按老规矩解压解码原图
-        val rawBitmap: Bitmap? = if (!book.isZip) {
-            val pages = getComicPagesFromFolder(context, book.uri)
-            if (pages.isNotEmpty()) {
-                val target = if (coverIndex < pages.size && coverIndex >= 0) coverIndex else 0
+        val rawBitmap = if (!chapter.isZip) {
+            val pages = getComicPagesFromFolder(context, chapter.sourceUri)
+            val targetIndex = coverIndex.coerceIn(0, (pages.size - 1).coerceAtLeast(0))
+            pages.getOrNull(targetIndex)?.let { pageUri ->
                 try {
-                    context.contentResolver.openInputStream(pages[target])?.use {
-                        BitmapFactory.decodeStream(it)
-                    }
-                } catch (e: Exception) { null }
-            } else null
+                    context.contentResolver.openInputStream(pageUri)?.use(BitmapFactory::decodeStream)
+                } catch (_: Exception) {
+                    null
+                }
+            }
         } else {
-            val tempCoverFile = File(context.cacheDir, "cover_${book.name}.zip")
-            if (copyZipToCache(context, book.uri, tempCoverFile)) {
-                val pages = getPagesFromZip(tempCoverFile)
-                if (pages.isNotEmpty()) {
-                    val target = if (coverIndex < pages.size && coverIndex >= 0) coverIndex else 0
-                    getZipPageBitmap(tempCoverFile, pages[target])
-                } else null
-            } else null
+            if (copyZipToCache(context, chapter.sourceUri, cacheZipFile)) {
+                val pages = getPagesFromZip(cacheZipFile)
+                val targetIndex = coverIndex.coerceIn(0, (pages.size - 1).coerceAtLeast(0))
+                pages.getOrNull(targetIndex)?.let { pageName ->
+                    getZipPageBitmap(cacheZipFile, pageName)
+                }
+            } else {
+                null
+            }
         }
 
-        // 🎯 策略三：原图解码成功后，现场压缩并写入磁盘，供下一次秒开
         if (rawBitmap != null) {
             try {
-                // 如果图片尺寸太夸张，先进行物理等比例下采样，压缩分辨率
                 val maxDimension = 500
                 val scaledBitmap = if (rawBitmap.width > maxDimension || rawBitmap.height > maxDimension) {
                     val aspectRatio = rawBitmap.width.toFloat() / rawBitmap.height.toFloat()
-                    val targetWidth = if (aspectRatio > 1) maxDimension else (maxDimension * aspectRatio).toInt()
-                    val targetHeight = if (aspectRatio > 1) (maxDimension / aspectRatio).toInt() else maxDimension
+                    val targetWidth = if (aspectRatio > 1f) maxDimension else (maxDimension * aspectRatio).toInt().coerceAtLeast(1)
+                    val targetHeight = if (aspectRatio > 1f) (maxDimension / aspectRatio).toInt().coerceAtLeast(1) else maxDimension
                     Bitmap.createScaledBitmap(rawBitmap, targetWidth, targetHeight, true)
                 } else {
                     rawBitmap
                 }
 
-                // 塞进本地 filesDir 目录（这个目录不会被系统自动清理）
-                FileOutputStream(diskCacheFile).use { fos ->
-                    scaledBitmap.compress(Bitmap.CompressFormat.JPEG, 80, fos) // 80% 质量，肉眼极难分辨，但体积缩减90%
+                FileOutputStream(diskCacheFile).use { outputStream ->
+                    scaledBitmap.compress(Bitmap.CompressFormat.JPEG, 80, outputStream)
                 }
 
                 if (scaledBitmap != rawBitmap) {
                     scaledBitmap.recycle()
                 }
                 rawBitmap.recycle()
-            } catch (e: Exception) {
-                e.printStackTrace()
+                return@withContext diskCacheFile
+            } catch (_: Exception) {
+                rawBitmap.recycle()
             }
-            return@withContext diskCacheFile
         }
 
-        return@withContext null
+        null
     }
 
-    // 获取文件夹内所有图片 Uri
     suspend fun getComicPagesFromFolder(context: Context, folderUri: Uri): List<Uri> = withContext(Dispatchers.IO) {
         val directory = DocumentFile.fromTreeUri(context, folderUri)
+            ?: DocumentFile.fromSingleUri(context, folderUri)
         if (directory == null || !directory.isDirectory) return@withContext emptyList()
 
         directory.listFiles()
-            .filter { file ->
-                val name = file.name ?: ""
-                file.isFile && (name.endsWith(".jpg", true) || name.endsWith(".png", true) || name.endsWith(".webp", true))
-            }
-            .map { file -> file.uri }
-            .sortedBy { it.toString() }
+            .filter(::isImageFile)
+            .map { it.uri }
+            .sortedBy { it.toString().lowercase() }
     }
 
-    // 复制压缩包到缓存
     suspend fun copyZipToCache(context: Context, zipUri: Uri, targetFile: File): Boolean = withContext(Dispatchers.IO) {
         try {
             context.contentResolver.openInputStream(zipUri)?.use { inputStream ->
-                FileOutputStream(targetFile).use { outputStream -> inputStream.copyTo(outputStream) }
-            }
+                FileOutputStream(targetFile).use { outputStream ->
+                    inputStream.copyTo(outputStream)
+                }
+            } ?: return@withContext false
             true
-        } catch (e: Exception) {
+        } catch (_: Exception) {
             false
         }
     }
 
-    // 获取压缩包内图片列表
     suspend fun getPagesFromZip(zipFile: File): List<String> = withContext(Dispatchers.IO) {
         try {
             ZipFile(zipFile).use { zip ->
                 zip.entries().toList()
-                    .filter { !it.isDirectory && (it.name.endsWith(".jpg", true) || it.name.endsWith(".png", true) || it.name.endsWith(".webp", true)) }
+                    .filter { entry -> !entry.isDirectory && isImageName(entry.name) }
                     .map { it.name }
-                    .sorted()
+                    .sortedBy { it.lowercase() }
             }
-        } catch (e: Exception) {
+        } catch (_: Exception) {
             emptyList()
         }
     }
 
-    // 动态解压单张图片
     suspend fun getZipPageBitmap(zipFile: File, entryName: String): Bitmap? = withContext(Dispatchers.IO) {
         try {
             ZipFile(zipFile).use { zip ->
                 val entry = zip.getEntry(entryName) ?: return@withContext null
-                zip.getInputStream(entry).use { BitmapFactory.decodeStream(it) }
+                zip.getInputStream(entry).use(BitmapFactory::decodeStream)
             }
-        } catch (e: Exception) {
+        } catch (_: Exception) {
             null
         }
+    }
+
+    private fun isArchiveFile(name: String?): Boolean {
+        val lowered = name?.lowercase() ?: return false
+        return lowered.endsWith(".zip") || lowered.endsWith(".cbz")
+    }
+
+    private fun isImageFile(file: DocumentFile): Boolean {
+        if (!file.isFile) return false
+        return isImageName(file.name)
+    }
+
+    private fun isImageName(name: String?): Boolean {
+        val lowered = name?.lowercase() ?: return false
+        return lowered.endsWith(".jpg") || lowered.endsWith(".jpeg") || lowered.endsWith(".png") || lowered.endsWith(".webp")
     }
 }
