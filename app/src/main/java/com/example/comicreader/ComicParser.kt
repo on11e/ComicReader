@@ -59,11 +59,14 @@ object ComicParser {
         if (!entry.isDirectory) return null
 
         val children = entry.listFiles()
-        val chapters = mutableListOf<ComicChapter>()
-        val hasDirectImages = children.any(::isImageFile)
+        val directImageFiles = children.filter(::isImageFile)
         val childChapterCandidates = children
             .filter { child -> child.isDirectory || isArchiveFile(child.name) }
             .sortedBy { it.name?.lowercase() ?: "" }
+        if (shouldIgnoreGeneratedMetadataFolder(children, directImageFiles, childChapterCandidates)) return null
+
+        val chapters = mutableListOf<ComicChapter>()
+        val hasDirectImages = directImageFiles.isNotEmpty()
 
         if (hasDirectImages) {
             chapters += ComicChapter(
@@ -108,6 +111,25 @@ object ComicParser {
             sourceUri = entry.uri,
             isZip = false
         )
+    }
+
+    private fun shouldIgnoreGeneratedMetadataFolder(
+        children: Array<DocumentFile>,
+        directImageFiles: List<DocumentFile>,
+        childChapterCandidates: List<DocumentFile>
+    ): Boolean {
+        if (childChapterCandidates.isNotEmpty()) return false
+        if (directImageFiles.size != 1) return false
+        if (!directImageFiles.first().name.equals("cover.jpg", ignoreCase = true)) return false
+
+        return children.all { child ->
+            when {
+                !child.isFile -> false
+                child.name.equals("cover.jpg", ignoreCase = true) -> true
+                child.name.equals("source_url.txt", ignoreCase = true) -> true
+                else -> false
+            }
+        }
     }
 
     suspend fun getBookCover(context: Context, book: ComicBook, cacheZipFile: File, coverIndex: Int): Any? = withContext(Dispatchers.IO) {

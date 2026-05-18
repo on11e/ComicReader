@@ -1,10 +1,15 @@
 package com.example.comicreader
 
+import android.app.Activity
+import android.content.ActivityNotFoundException
 import android.content.Context
+import android.content.Intent
 import android.content.SharedPreferences
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.net.Uri
 import android.os.Bundle
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -50,6 +55,8 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.MaterialTheme
@@ -93,10 +100,17 @@ import androidx.core.content.edit
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
+import androidx.documentfile.provider.DocumentFile
 import coil.compose.AsyncImage
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import org.json.JSONArray
+import org.json.JSONObject
 import java.io.File
+import java.io.FileOutputStream
+import java.util.UUID
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -122,8 +136,21 @@ private data class BookMetadata(
     val customDesc: String,
     val tags: List<String>,
     val coverPage: Int,
-    val autoNextChapter: Boolean
+    val autoNextChapter: Boolean,
+    val openExternally: Boolean,
+    val externalUrl: String,
+    val customCoverUri: String
 )
+
+private data class ExternalBookEntry(
+    val id: String,
+    val seedName: String
+)
+
+private object NoCoverImage
+
+private const val EXTERNAL_BOOK_ID_PREFIX = "external_book::"
+private const val EXTERNAL_BOOKS_PREF_KEY = "external_books"
 
 @Composable
 fun MainAppScreen() {
@@ -131,12 +158,20 @@ fun MainAppScreen() {
     val sharedPrefs = remember { context.getSharedPreferences("comic_progress_prefs", Context.MODE_PRIVATE) }
 
     var rootFolderUri by remember { mutableStateOf<Uri?>(null) }
-    var bookshelf by remember { mutableStateOf<List<ComicBook>>(emptyList()) }
+    var localBooks by remember { mutableStateOf<List<ComicBook>>(emptyList()) }
     var selectedBook by remember { mutableStateOf<ComicBook?>(null) }
     var currentReaderSession by remember { mutableStateOf<ReaderSession?>(null) }
     var isScanning by remember { mutableStateOf(false) }
     var refreshTrigger by remember { mutableIntStateOf(0) }
     var selectedTag by remember { mutableStateOf<String?>(null) }
+    var showAddExternalDialog by remember { mutableStateOf(false) }
+
+    fun refreshBookshelf(rescanLocal: Boolean = true) {
+        refreshTrigger++
+        if (rescanLocal && rootFolderUri != null) {
+            isScanning = true
+        }
+    }
 
     val libraryLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
         if (uri != null) {
@@ -163,12 +198,30 @@ fun MainAppScreen() {
     }
 
     LaunchedEffect(rootFolderUri, isScanning, refreshTrigger) {
-        if (rootFolderUri != null && isScanning) {
-            bookshelf = ComicParser.scanBookshelf(context, rootFolderUri!!)
-            selectedTag = selectedTag?.takeIf { tag ->
-                bookshelf.any { book -> readBookMetadata(sharedPrefs, book).tags.contains(tag) }
-            }
-            isScanning = false
+        if (!isScanning) return@LaunchedEffect
+
+        localBooks = if (rootFolderUri != null) {
+            ComicParser.scanBookshelf(context, rootFolderUri!!)
+        } else {
+            emptyList()
+        }
+        isScanning = false
+    }
+
+    val externalBooks = remember(refreshTrigger) {
+        loadExternalBooks(sharedPrefs)
+    }
+    val bookshelf = remember(localBooks, externalBooks, refreshTrigger) {
+        (localBooks + externalBooks).sortedBy { book ->
+            readBookMetadata(sharedPrefs, book).customName.lowercase()
+        }
+    }
+    LaunchedEffect(bookshelf, selectedTag) {
+        selectedTag = selectedTag?.takeIf { tag ->
+            bookshelf.any { book -> readBookMetadata(sharedPrefs, book).tags.contains(tag) }
+        }
+        selectedBook = selectedBook?.takeIf { current ->
+            bookshelf.any { it.id == current.id }
         }
     }
 
@@ -183,19 +236,22 @@ fun MainAppScreen() {
             selectedTag == null || metadataMap[book.id]?.tags?.contains(selectedTag) == true
         }
     }
+    LaunchedEffect(rootFolderUri, bookshelf, metadataMap) {
+        val folderUri = rootFolderUri ?: return@LaunchedEffect
+        syncBookshelfAssets(context, folderUri, bookshelf, metadataMap)
+    }
 
     when {
-        rootFolderUri == null -> LibrarySetupScreen(onPickFolder = { libraryLauncher.launch(null) })
         currentReaderSession != null -> ComicReaderScreen(
             book = currentReaderSession!!.book,
             initialChapterIndex = currentReaderSession!!.initialChapterIndex,
             onBack = { currentReaderSession = null }
         )
-        selectedBook != null -> BookDetailScreen(
+        selectedBook != null -> BookDetailScreenV2(
             book = selectedBook!!,
             metadata = metadataMap[selectedBook!!.id] ?: readBookMetadata(sharedPrefs, selectedBook!!),
             onBack = { selectedBook = null },
-            onEditFinished = { refreshTrigger++ },
+            onEditFinished = { refreshBookshelf(rescanLocal = false) },
             onReadChapter = { chapterIndex ->
                 currentReaderSession = ReaderSession(selectedBook!!, chapterIndex)
             }
@@ -206,21 +262,38 @@ fun MainAppScreen() {
             allTags = allTags,
             selectedTag = selectedTag,
             isScanning = isScanning,
+            hasLibraryFolder = rootFolderUri != null,
             onTagSelected = { selectedTag = it },
             onBookClick = { book ->
-                if (book.chapters.size > 1) {
-                    selectedBook = book
-                } else {
-                    currentReaderSession = ReaderSession(book, resolveLastChapterIndex(sharedPrefs, book))
-                }
+                selectedBook = book
             },
-            onRefreshMetadata = { refreshTrigger++ },
-            onChangeFolder = {
-                sharedPrefs.edit { remove("saved_root_folder_uri") }
-                rootFolderUri = null
-                bookshelf = emptyList()
-                selectedBook = null
-                currentReaderSession = null
+            onRefreshMetadata = { refreshBookshelf(rescanLocal = false) },
+            onDeleteBook = { book ->
+                val deleted = deleteComicBook(context, sharedPrefs, book)
+                if (deleted) {
+                    selectedBook = selectedBook?.takeIf { it.id != book.id }
+                    currentReaderSession = currentReaderSession?.takeIf { it.book.id != book.id }
+                    refreshBookshelf()
+                }
+                deleted
+            },
+            onPickFolder = { libraryLauncher.launch(null) },
+            onAddExternalBook = {
+                if (rootFolderUri == null) {
+                    Toast.makeText(context, "请先选择漫画目录", Toast.LENGTH_SHORT).show()
+                } else {
+                    showAddExternalDialog = true
+                }
+            }
+        )
+    }
+
+    if (showAddExternalDialog) {
+        ExternalBookEditorDialog(
+            onDismiss = { showAddExternalDialog = false },
+            onSaved = {
+                showAddExternalDialog = false
+                refreshBookshelf(rescanLocal = false)
             }
         )
     }
@@ -259,13 +332,17 @@ private fun BookshelfScreen(
     allTags: List<String>,
     selectedTag: String?,
     isScanning: Boolean,
+    hasLibraryFolder: Boolean,
     onTagSelected: (String?) -> Unit,
     onBookClick: (ComicBook) -> Unit,
     onRefreshMetadata: () -> Unit,
-    onChangeFolder: () -> Unit
+    onDeleteBook: suspend (ComicBook) -> Boolean,
+    onPickFolder: () -> Unit,
+    onAddExternalBook: () -> Unit
 ) {
     val context = LocalContext.current
     val sharedPrefs = remember { context.getSharedPreferences("comic_progress_prefs", Context.MODE_PRIVATE) }
+    var showMenu by remember { mutableStateOf(false) }
 
     Scaffold(
         topBar = {
@@ -282,13 +359,30 @@ private fun BookshelfScreen(
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Text("我的书架", color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.Bold)
-                    OutlinedButton(
-                        onClick = onChangeFolder,
-                        shape = RoundedCornerShape(8.dp),
-                        border = BorderStroke(1.dp, Color(0xFF353547)),
-                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
-                    ) {
-                        Text("目录", color = Color(0xFFC7C7D8), fontSize = 12.sp, fontWeight = FontWeight.Medium)
+                    Box {
+                        TextButton(onClick = { showMenu = true }) {
+                            Text("☰", color = Color.White, fontSize = 22.sp, fontWeight = FontWeight.Bold)
+                        }
+                        DropdownMenu(
+                            expanded = showMenu,
+                            onDismissRequest = { showMenu = false },
+                            containerColor = Color(0xFF1C1C28)
+                        ) {
+                            DropdownMenuItem(
+                                text = { Text("添加外链漫画", color = Color.White) },
+                                onClick = {
+                                    showMenu = false
+                                    onAddExternalBook()
+                                }
+                            )
+                            DropdownMenuItem(
+                                text = { Text(if (hasLibraryFolder) "更换目录" else "选择目录", color = Color.White) },
+                                onClick = {
+                                    showMenu = false
+                                    onPickFolder()
+                                }
+                            )
+                        }
                     }
                 }
                 if (allTags.isNotEmpty()) {
@@ -344,7 +438,11 @@ private fun BookshelfScreen(
                 ) {
                     Text(
                         text = if (selectedTag == null) {
-                            "当前目录下没有可识别的漫画文件夹或 ZIP/CBZ 压缩包。"
+                            if (hasLibraryFolder) {
+                                "当前目录下没有可识别的漫画文件夹或 ZIP/CBZ 压缩包。"
+                            } else {
+                                "书架还是空的。你可以先添加外链漫画，也可以选择本地目录进行扫描。"
+                            }
                         } else {
                             "当前标签下还没有漫画，试试切换其他标签。"
                         },
@@ -369,7 +467,8 @@ private fun BookshelfScreen(
                             book = book,
                             metadata = metadataMap[book.id] ?: readBookMetadata(sharedPrefs, book),
                             onClick = { onBookClick(book) },
-                            onMetaChanged = onRefreshMetadata
+                            onMetaChanged = onRefreshMetadata,
+                            onDelete = onDeleteBook
                         )
                     }
                 }
@@ -383,15 +482,24 @@ private fun BookCard(
     book: ComicBook,
     metadata: BookMetadata,
     onClick: () -> Unit,
-    onMetaChanged: () -> Unit
+    onMetaChanged: () -> Unit,
+    onDelete: suspend (ComicBook) -> Boolean
 ) {
     val context = LocalContext.current
-    var coverData by remember(book.id, metadata.coverPage) { mutableStateOf<Any?>(null) }
+    var coverData by remember(book.id, metadata.coverPage, metadata.customCoverUri) { mutableStateOf<Any?>(null) }
+    var showActionDialog by remember { mutableStateOf(false) }
     var showEditDialog by remember { mutableStateOf(false) }
+    var showDeleteConfirm by remember { mutableStateOf(false) }
+    var isDeleting by remember { mutableStateOf(false) }
     val cacheZipFile = remember(book.id) { File(context.cacheDir, "cover_${book.id.hashCode()}.zip") }
+    val scope = rememberCoroutineScope()
 
-    LaunchedEffect(book.id, metadata.coverPage) {
-        coverData = ComicParser.getBookCover(context, book, cacheZipFile, metadata.coverPage - 1)
+    LaunchedEffect(book.id, metadata.coverPage, metadata.customCoverUri) {
+        coverData = when {
+            metadata.customCoverUri.isNotBlank() -> resolveStoredCoverModel(metadata.customCoverUri)
+            book.chapters.isNotEmpty() -> ComicParser.getBookCover(context, book, cacheZipFile, metadata.coverPage - 1) ?: NoCoverImage
+            else -> NoCoverImage
+        }
     }
 
     Card(
@@ -402,7 +510,7 @@ private fun BookCard(
             .pointerInput(book.id) {
                 detectTapGestures(
                     onTap = { onClick() },
-                    onLongPress = { showEditDialog = true }
+                    onLongPress = { showActionDialog = true }
                 )
             }
             .padding(bottom = 2.dp),
@@ -428,6 +536,7 @@ private fun BookCard(
                             .align(Alignment.Center)
                             .size(24.dp)
                     )
+                    NoCoverImage -> ExternalCoverPlaceholderV2(metadata.customName)
                     else -> AsyncImage(
                         model = data,
                         contentDescription = null,
@@ -447,7 +556,7 @@ private fun BookCard(
                     text = metadata.customName,
                     color = Color.White,
                     fontSize = 15.sp,
-                    maxLines = 2,
+                    maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                     fontWeight = FontWeight.Bold,
                     lineHeight = 18.sp
@@ -466,30 +575,114 @@ private fun BookCard(
                 } else {
                     Spacer(modifier = Modifier.height(8.dp))
                 }
-                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    MetaPill(text = "共 ${book.chapters.size} 章")
-                    metadata.tags.filter { it.isNotBlank() }.take(2).forEach { tag ->
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    MetaPill(text = if (book.chapters.isNotEmpty()) "共 ${book.chapters.size} 章" else "外链漫画")
+                    if (metadata.externalUrl.isNotBlank()) {
+                        MetaPill(text = "外链", accent = true)
+                    }
+                    metadata.tags.filter { it.isNotBlank() && !metadata.openExternally }.forEach { tag ->
                         MetaPill(text = tag, accent = true)
                     }
-                }
-                if (metadata.tags.size > 2) {
-                    Spacer(modifier = Modifier.height(6.dp))
-                    MetaPill(text = "还有 ${metadata.tags.size - 2} 个")
                 }
             }
         }
     }
 
-    if (showEditDialog) {
-        EditBookMetadataDialog(
-            book = book,
-            initialMetadata = metadata,
-            onDismiss = { showEditDialog = false },
-            onSaved = {
-                showEditDialog = false
-                onMetaChanged()
+    if (showActionDialog) {
+        AlertDialog(
+            onDismissRequest = { showActionDialog = false },
+            title = { Text("漫画操作") },
+            text = { Text("你可以编辑资料，或删除这本漫画。") },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        showActionDialog = false
+                        showEditDialog = true
+                    }
+                ) { Text("编辑") }
+            },
+            dismissButton = {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    TextButton(
+                        onClick = {
+                            showActionDialog = false
+                            showDeleteConfirm = true
+                        }
+                    ) { Text("删除", color = Color(0xFFE57373)) }
+                    TextButton(onClick = { showActionDialog = false }) { Text("取消") }
+                }
             }
         )
+    }
+
+    if (showDeleteConfirm) {
+        AlertDialog(
+            onDismissRequest = {
+                if (!isDeleting) showDeleteConfirm = false
+            },
+            title = { Text("确认删除") },
+            text = {
+                Text(
+                    if (book.chapters.isEmpty()) {
+                        "删除后将移除这本外链漫画及其配置。"
+                    } else {
+                        "删除后将移除这本漫画及本地文件，无法恢复。"
+                    }
+                )
+            },
+            confirmButton = {
+                Button(
+                    enabled = !isDeleting,
+                    onClick = {
+                        if (isDeleting) return@Button
+                        isDeleting = true
+                        scope.launch {
+                            val deleted = onDelete(book)
+                            isDeleting = false
+                            showDeleteConfirm = false
+                            if (!deleted) {
+                                Toast.makeText(context, "删除失败，请检查目录权限后重试", Toast.LENGTH_SHORT).show()
+                            }
+                        }
+                    }
+                ) { Text(if (isDeleting) "删除中..." else "确认删除") }
+            },
+            dismissButton = {
+                TextButton(
+                    enabled = !isDeleting,
+                    onClick = { showDeleteConfirm = false }
+                ) { Text("取消") }
+            }
+        )
+    }
+
+    if (showEditDialog) {
+        if (metadata.openExternally && book.chapters.isEmpty()) {
+            ExternalBookEditorDialog(
+                existingBook = book,
+                initialMetadata = metadata,
+                onDismiss = { showEditDialog = false },
+                onSaved = {
+                    showEditDialog = false
+                    onMetaChanged()
+                }
+            )
+        } else {
+            EditBookMetadataDialog(
+                book = book,
+                initialMetadata = metadata,
+                onDismiss = { showEditDialog = false },
+                onSaved = {
+                    showEditDialog = false
+                    onMetaChanged()
+                }
+            )
+        }
     }
 }
 
@@ -512,7 +705,242 @@ private fun MetaPill(text: String, accent: Boolean = false) {
 }
 
 @Composable
-private fun BookDetailScreen(
+private fun ExternalCoverPlaceholder(title: String) {
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Brush.linearGradient(listOf(Color(0xFF2A2037), Color(0xFF151520)))),
+        contentAlignment = Alignment.Center
+    ) {
+        Text(
+            text = title.trim().take(1).ifBlank { "漫" },
+            color = Color.White,
+            fontSize = 42.sp,
+            fontWeight = FontWeight.Black
+        )
+    }
+}
+
+@Composable
+private fun ExternalBookDialog(
+    existingBook: ComicBook? = null,
+    initialMetadata: BookMetadata? = null,
+    onDismiss: () -> Unit,
+    onSaved: () -> Unit
+) {
+    val context = LocalContext.current
+    val sharedPrefs = remember { context.getSharedPreferences("comic_progress_prefs", Context.MODE_PRIVATE) }
+
+    var inputName by remember { mutableStateOf(initialMetadata?.customName ?: "") }
+    var inputDesc by remember { mutableStateOf(initialMetadata?.customDesc ?: "这本漫画会跳转到外部网站进行阅读。") }
+    var inputTags by remember { mutableStateOf(initialMetadata?.tags?.joinToString(", ").orEmpty()) }
+    var inputExternalUrl by remember { mutableStateOf(initialMetadata?.externalUrl.orEmpty()) }
+    var inputCoverUri by remember { mutableStateOf(initialMetadata?.customCoverUri.orEmpty()) }
+    val imagePicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) {
+            saveCoverToAppStorage(context, uri)?.let { storedUri ->
+                inputCoverUri = storedUri
+            } ?: Toast.makeText(context, "封面保存失败，请重新选择图片", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(if (existingBook == null) "添加外链漫画" else "编辑外链漫画") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                TextField(
+                    value = inputName,
+                    onValueChange = { inputName = it },
+                    label = { Text("漫画名称") },
+                    modifier = Modifier.fillMaxWidth()
+                )
+                TextField(
+                    value = inputExternalUrl,
+                    onValueChange = { inputExternalUrl = it },
+                    label = { Text("来源网站地址") },
+                    modifier = Modifier.fillMaxWidth()
+                )
+                TextField(
+                    value = inputDesc,
+                    onValueChange = { inputDesc = it },
+                    label = { Text("简介") },
+                    modifier = Modifier.fillMaxWidth()
+                )
+                TextField(
+                    value = inputTags,
+                    onValueChange = { inputTags = it },
+                    label = { Text("标签，使用逗号分隔") },
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Card(
+                    colors = CardDefaults.cardColors(containerColor = Color(0xFF1B1B25)),
+                    border = BorderStroke(1.dp, Color(0xFF303041))
+                ) {
+                    Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text("自定义封面", color = Color.White, fontWeight = FontWeight.Bold)
+                        Text(
+                            text = if (inputCoverUri.isBlank()) "未选择封面图，将使用默认占位图。" else inputCoverUri,
+                            color = Color(0xFFC6C6D4),
+                            fontSize = 12.sp,
+                            lineHeight = 18.sp
+                        )
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            OutlinedButton(onClick = { imagePicker.launch(arrayOf("image/*")) }) {
+                                Text("选择图片")
+                            }
+                            if (inputCoverUri.isNotBlank()) {
+                                OutlinedButton(onClick = { inputCoverUri = "" }) {
+                                    Text("清除")
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = {
+                    val name = inputName.trim()
+                    val externalUrl = inputExternalUrl.trim()
+                    if (name.isBlank()) {
+                        Toast.makeText(context, "请先填写漫画名称", Toast.LENGTH_SHORT).show()
+                        return@Button
+                    }
+                    if (!isValidExternalUrl(externalUrl)) {
+                        Toast.makeText(context, "外链地址必须以 http:// 或 https:// 开头", Toast.LENGTH_SHORT).show()
+                        return@Button
+                    }
+
+                    val bookId = existingBook?.id ?: "$EXTERNAL_BOOK_ID_PREFIX${UUID.randomUUID()}"
+                    upsertExternalBookEntry(sharedPrefs, ExternalBookEntry(bookId, name))
+                    sharedPrefs.edit {
+                        putString("${bookId}_custom_name", name)
+                        putString("${bookId}_custom_desc", inputDesc.trim().ifBlank { "这本漫画会跳转到外部网站进行阅读。" })
+                        putString("${bookId}_tags", normalizeTags(inputTags).joinToString(","))
+                        putInt("${bookId}_cover_index", 1)
+                        putBoolean("${bookId}_auto_next", false)
+                        putBoolean("${bookId}_external_only", true)
+                        putBoolean("${bookId}_open_externally", true)
+                        putString("${bookId}_external_url", externalUrl)
+                        putString("${bookId}_custom_cover_uri", inputCoverUri.trim())
+                    }
+                    onSaved()
+                }
+            ) { Text("保存") }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("取消") }
+        }
+    )
+}
+
+@Composable
+private fun ExternalCoverPlaceholderV2(title: String) {
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Brush.linearGradient(listOf(Color(0xFF2A2037), Color(0xFF151520)))),
+        contentAlignment = Alignment.Center
+    ) {
+        Text(
+            text = title.trim().take(1).ifBlank { "漫" },
+            color = Color.White,
+            fontSize = 42.sp,
+            fontWeight = FontWeight.Black
+        )
+    }
+}
+
+@Composable
+private fun ExternalBookEditorDialog(
+    existingBook: ComicBook? = null,
+    initialMetadata: BookMetadata? = null,
+    onDismiss: () -> Unit,
+    onSaved: () -> Unit
+) {
+    val context = LocalContext.current
+    val sharedPrefs = remember { context.getSharedPreferences("comic_progress_prefs", Context.MODE_PRIVATE) }
+
+    var inputName by remember { mutableStateOf(initialMetadata?.customName ?: "") }
+    var inputDesc by remember { mutableStateOf(initialMetadata?.customDesc ?: "这本漫画会跳转到外部网站进行阅读。") }
+    var inputExternalUrl by remember { mutableStateOf(initialMetadata?.externalUrl.orEmpty()) }
+    var inputCoverUri by remember { mutableStateOf(initialMetadata?.customCoverUri.orEmpty()) }
+    val imagePicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) {
+            saveCoverToAppStorage(context, uri)?.let { storedUri ->
+                inputCoverUri = storedUri
+            } ?: Toast.makeText(context, "封面保存失败，请重新选择图片", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(if (existingBook == null) "添加外链漫画" else "编辑外链漫画") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                TextField(value = inputName, onValueChange = { inputName = it }, label = { Text("漫画名称") }, modifier = Modifier.fillMaxWidth())
+                TextField(value = inputExternalUrl, onValueChange = { inputExternalUrl = it }, label = { Text("来源网站地址") }, modifier = Modifier.fillMaxWidth())
+                TextField(value = inputDesc, onValueChange = { inputDesc = it }, label = { Text("简介") }, modifier = Modifier.fillMaxWidth())
+                Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF1B1B25)), border = BorderStroke(1.dp, Color(0xFF303041))) {
+                    Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text("自定义封面", color = Color.White, fontWeight = FontWeight.Bold)
+                        Text(
+                            text = if (inputCoverUri.isBlank()) "未选择封面图，将使用默认占位图。" else inputCoverUri,
+                            color = Color(0xFFC6C6D4),
+                            fontSize = 12.sp,
+                            lineHeight = 18.sp
+                        )
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            OutlinedButton(onClick = { imagePicker.launch(arrayOf("image/*")) }) { Text("选择图片") }
+                            if (inputCoverUri.isNotBlank()) {
+                                OutlinedButton(onClick = { inputCoverUri = "" }) { Text("清除") }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = {
+                    val name = inputName.trim()
+                    val externalUrl = inputExternalUrl.trim()
+                    if (name.isBlank()) {
+                        Toast.makeText(context, "请先填写漫画名称", Toast.LENGTH_SHORT).show()
+                        return@Button
+                    }
+                    if (!isValidExternalUrl(externalUrl)) {
+                        Toast.makeText(context, "外链地址必须以 http:// 或 https:// 开头", Toast.LENGTH_SHORT).show()
+                        return@Button
+                    }
+
+                    val bookId = existingBook?.id ?: "$EXTERNAL_BOOK_ID_PREFIX${UUID.randomUUID()}"
+                    upsertExternalBookEntry(sharedPrefs, ExternalBookEntry(bookId, name))
+                    sharedPrefs.edit {
+                        putString("${bookId}_custom_name", name)
+                        putString("${bookId}_custom_desc", inputDesc.trim().ifBlank { "这本漫画会跳转到外部网站进行阅读。" })
+                        putString("${bookId}_tags", "")
+                        putInt("${bookId}_cover_index", 1)
+                        putBoolean("${bookId}_auto_next", false)
+                        putBoolean("${bookId}_external_only", true)
+                        putBoolean("${bookId}_open_externally", true)
+                        putString("${bookId}_external_url", externalUrl)
+                        putString("${bookId}_custom_cover_uri", inputCoverUri.trim())
+                    }
+                    onSaved()
+                }
+            ) { Text("保存") }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("取消") }
+        }
+    )
+}
+
+@Composable
+private fun BookDetailScreenV2(
     book: ComicBook,
     metadata: BookMetadata,
     onBack: () -> Unit,
@@ -522,7 +950,12 @@ private fun BookDetailScreen(
     val context = LocalContext.current
     val sharedPrefs = remember { context.getSharedPreferences("comic_progress_prefs", Context.MODE_PRIVATE) }
     var showEditDialog by remember { mutableStateOf(false) }
-    val lastChapterIndex = remember(book.id) { resolveLastChapterIndex(sharedPrefs, book) }
+    val hasLocalChapters = book.chapters.isNotEmpty()
+    val hasExternalUrl = metadata.externalUrl.isNotBlank()
+    val isExternalOnly = metadata.openExternally && !hasLocalChapters
+    val lastChapterIndex = remember(book.id, hasLocalChapters) {
+        if (hasLocalChapters) resolveLastChapterIndex(sharedPrefs, book) else 0
+    }
 
     Scaffold(
         topBar = {
@@ -536,7 +969,7 @@ private fun BookDetailScreen(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 TextButton(onClick = onBack) { Text("返回", color = Color.White) }
-                TextButton(onClick = { showEditDialog = true }) { Text("编辑标签", color = Color(0xFFBB86FC)) }
+                TextButton(onClick = { showEditDialog = true }) { Text("编辑资料", color = Color(0xFFBB86FC)) }
             }
         },
         containerColor = Color(0xFF12121A)
@@ -569,7 +1002,197 @@ private fun BookDetailScreen(
                             modifier = Modifier.horizontalScroll(rememberScrollState()),
                             horizontalArrangement = Arrangement.spacedBy(8.dp)
                         ) {
-                            MetaPill(text = "共 ${book.chapters.size} 章")
+                            MetaPill(text = if (hasLocalChapters) "共 ${book.chapters.size} 章" else "外链漫画")
+                            if (hasExternalUrl) {
+                                MetaPill(text = "在线阅读", accent = true)
+                            }
+                            metadata.tags.filter { it.isNotBlank() && !metadata.openExternally }.forEach { tag ->
+                                MetaPill(text = tag, accent = true)
+                            }
+                        }
+                    }
+                }
+            }
+            if (hasExternalUrl) {
+                item {
+                    Button(
+                        onClick = { openExternalComic(context, metadata.externalUrl) },
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF8E6BD8)),
+                        shape = RoundedCornerShape(14.dp),
+                        contentPadding = PaddingValues(horizontal = 18.dp, vertical = 12.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("在线阅读", color = Color.White, fontWeight = FontWeight.Bold)
+                    }
+                }
+                item {
+                    Card(
+                        colors = CardDefaults.cardColors(containerColor = Color(0xFF1B1B25)),
+                        border = BorderStroke(1.dp, Color(0xFF303041))
+                    ) {
+                        Text(
+                            text = "来源网站：${metadata.externalUrl}",
+                            modifier = Modifier.padding(16.dp),
+                            color = Color(0xFFBB86FC),
+                            fontSize = 13.sp,
+                            lineHeight = 18.sp
+                        )
+                    }
+                }
+            }
+            if (hasLocalChapters) {
+                item {
+                    Text(
+                        text = "本地章节",
+                        color = Color.White,
+                        fontSize = 18.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+                if (book.chapters.size == 1) {
+                    item {
+                        Card(
+                            colors = CardDefaults.cardColors(containerColor = Color(0xFF1B1B25)),
+                            border = BorderStroke(1.dp, Color(0xFF303041))
+                        ) {
+                            Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                                Text("如何测试多章节", color = Color.White, fontWeight = FontWeight.Bold)
+                                Text(
+                                    text = "在漫画根目录下先建立一个作品文件夹，然后创建“第1话”“第2话”“第3话”这类子文件夹，并把图片放进去。放在作品文件夹内的 ZIP/CBZ 也会被识别为章节。",
+                                    color = Color(0xFFC6C6D4),
+                                    fontSize = 13.sp,
+                                    lineHeight = 18.sp
+                                )
+                            }
+                        }
+                    }
+                }
+                itemsIndexed(book.chapters, key = { _, chapter -> chapter.id }) { index, chapter ->
+                    Card(
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = CardDefaults.cardColors(
+                            containerColor = if (index == lastChapterIndex) Color(0xFF222238) else Color(0xFF1A1A24)
+                        ),
+                        shape = RoundedCornerShape(18.dp),
+                        border = if (index == lastChapterIndex) BorderStroke(1.dp, Color(0xFF4A4A76)) else null
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 16.dp, vertical = 14.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxWidth(0.7f)
+                                    .padding(end = 12.dp)
+                            ) {
+                                Text(chapter.name, color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                                Text(if (chapter.isZip) "ZIP/CBZ 章节" else "文件夹章节", color = Color(0xFF9A9AA8), fontSize = 12.sp)
+                            }
+                            Button(onClick = { onReadChapter(index) }) {
+                                Text(if (index == lastChapterIndex) "继续" else "阅读")
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (showEditDialog) {
+        if (isExternalOnly) {
+            ExternalBookEditorDialog(
+                existingBook = book,
+                initialMetadata = metadata,
+                onDismiss = { showEditDialog = false },
+                onSaved = {
+                    showEditDialog = false
+                    onEditFinished()
+                }
+            )
+        } else {
+            EditBookMetadataDialog(
+                book = book,
+                initialMetadata = metadata,
+                onDismiss = { showEditDialog = false },
+                onSaved = {
+                    showEditDialog = false
+                    onEditFinished()
+                }
+            )
+        }
+    }
+}
+
+@Composable
+private fun BookDetailScreen(
+    book: ComicBook,
+    metadata: BookMetadata,
+    onBack: () -> Unit,
+    onEditFinished: () -> Unit,
+    onReadChapter: (Int) -> Unit
+) {
+    val context = LocalContext.current
+    val sharedPrefs = remember { context.getSharedPreferences("comic_progress_prefs", Context.MODE_PRIVATE) }
+    var showEditDialog by remember { mutableStateOf(false) }
+    val hasLocalChapters = book.chapters.isNotEmpty()
+    val hasExternalUrl = metadata.externalUrl.isNotBlank()
+    val isExternalOnly = metadata.openExternally && !hasLocalChapters
+    val lastChapterIndex = remember(book.id, hasLocalChapters) {
+        if (hasLocalChapters) resolveLastChapterIndex(sharedPrefs, book) else 0
+    }
+
+    Scaffold(
+        topBar = {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(Color(0xFF111119))
+                    .statusBarsPadding()
+                    .padding(horizontal = 16.dp, vertical = 10.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                TextButton(onClick = onBack) { Text("返回", color = Color.White) }
+                TextButton(onClick = { showEditDialog = true }) { Text("编辑资料", color = Color(0xFFBB86FC)) }
+            }
+        },
+        containerColor = Color(0xFF12121A)
+    ) { paddingValues ->
+        LazyColumn(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(paddingValues),
+            contentPadding = PaddingValues(20.dp),
+            verticalArrangement = Arrangement.spacedBy(16.dp)
+        ) {
+            item {
+                Card(
+                    colors = CardDefaults.cardColors(containerColor = Color(0xFF171720)),
+                    shape = RoundedCornerShape(22.dp)
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .background(Brush.verticalGradient(listOf(Color(0xFF202033), Color(0xFF171720))))
+                            .padding(18.dp)
+                    ) {
+                        Text(metadata.customName, color = Color.White, fontSize = 28.sp, fontWeight = FontWeight.Black)
+                        if (shouldShowDescription(book, metadata)) {
+                            Spacer(modifier = Modifier.height(8.dp))
+                            Text(metadata.customDesc, color = Color(0xFFB9B9C6), fontSize = 14.sp, lineHeight = 20.sp)
+                        }
+                        Spacer(modifier = Modifier.height(14.dp))
+                        Row(
+                            modifier = Modifier.horizontalScroll(rememberScrollState()),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            MetaPill(text = if (hasLocalChapters) "共 ${book.chapters.size} 章" else "外链漫画")
+                            if (hasExternalUrl) {
+                                MetaPill(text = if (isExternalOnly) "在线来源" else "可在线阅读", accent = true)
+                            }
                             metadata.tags.filter { it.isNotBlank() }.forEach { tag ->
                                 MetaPill(text = tag, accent = true)
                             }
@@ -577,17 +1200,63 @@ private fun BookDetailScreen(
                     }
                 }
             }
-            item {
-                Button(
-                    onClick = { onReadChapter(lastChapterIndex) },
-                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFE7B95A)),
-                    shape = RoundedCornerShape(14.dp),
-                    contentPadding = PaddingValues(horizontal = 18.dp, vertical = 12.dp)
-                ) {
-                    Text("继续阅读 ${book.chapters[lastChapterIndex].name}", color = Color(0xFF111119), fontWeight = FontWeight.Bold)
+            if (hasLocalChapters || hasExternalUrl) {
+                item {
+                    Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                        if (hasLocalChapters) {
+                            Button(
+                                onClick = { onReadChapter(lastChapterIndex) },
+                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFE7B95A)),
+                                shape = RoundedCornerShape(14.dp),
+                                contentPadding = PaddingValues(horizontal = 18.dp, vertical = 12.dp),
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Text(
+                                    text = "本地阅读 ${book.chapters[lastChapterIndex].name}",
+                                    color = Color(0xFF111119),
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
+                        }
+                        if (hasExternalUrl) {
+                            Button(
+                                onClick = { openExternalComic(context, metadata.externalUrl) },
+                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF8E6BD8)),
+                                shape = RoundedCornerShape(14.dp),
+                                contentPadding = PaddingValues(horizontal = 18.dp, vertical = 12.dp),
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Text("在线阅读", color = Color.White, fontWeight = FontWeight.Bold)
+                            }
+                        }
+                    }
                 }
             }
-            if (book.chapters.size == 1) {
+            if (hasExternalUrl) {
+                item {
+                    Card(
+                        colors = CardDefaults.cardColors(containerColor = Color(0xFF1B1B25)),
+                        border = BorderStroke(1.dp, Color(0xFF303041))
+                    ) {
+                        Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                            Text(if (isExternalOnly) "当前为外链漫画" else "已配置来源网站", color = Color.White, fontWeight = FontWeight.Bold)
+                            Text(
+                                text = if (isExternalOnly) {
+                                    "这本漫画没有本地章节内容，点击上方在线阅读后会跳转到预设网站。"
+                                } else {
+                                    "这本漫画除了本地章节外，也保留了来源网站入口，方便溯源或在线查看。"
+                                },
+                                color = Color(0xFFC6C6D4),
+                                fontSize = 13.sp,
+                                lineHeight = 18.sp
+                            )
+                            if (hasExternalUrl) {
+                                Text(metadata.externalUrl, color = Color(0xFFBB86FC), fontSize = 12.sp, lineHeight = 18.sp)
+                            }
+                        }
+                    }
+                }
+            } else if (book.chapters.size == 1) {
                 item {
                     Card(
                         colors = CardDefaults.cardColors(containerColor = Color(0xFF1B1B25)),
@@ -605,32 +1274,34 @@ private fun BookDetailScreen(
                     }
                 }
             }
-            itemsIndexed(book.chapters, key = { _, chapter -> chapter.id }) { index, chapter ->
-                Card(
-                    modifier = Modifier.fillMaxWidth(),
-                    colors = CardDefaults.cardColors(
-                        containerColor = if (index == lastChapterIndex) Color(0xFF222238) else Color(0xFF1A1A24)
-                    ),
-                    shape = RoundedCornerShape(18.dp),
-                    border = if (index == lastChapterIndex) BorderStroke(1.dp, Color(0xFF4A4A76)) else null
-                ) {
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(horizontal = 16.dp, vertical = 14.dp),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
+            if (hasLocalChapters) {
+                itemsIndexed(book.chapters, key = { _, chapter -> chapter.id }) { index, chapter ->
+                    Card(
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = CardDefaults.cardColors(
+                            containerColor = if (index == lastChapterIndex) Color(0xFF222238) else Color(0xFF1A1A24)
+                        ),
+                        shape = RoundedCornerShape(18.dp),
+                        border = if (index == lastChapterIndex) BorderStroke(1.dp, Color(0xFF4A4A76)) else null
                     ) {
-                        Column(
+                        Row(
                             modifier = Modifier
-                                .fillMaxWidth(0.7f)
-                                .padding(end = 12.dp)
+                                .fillMaxWidth()
+                                .padding(horizontal = 16.dp, vertical = 14.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
                         ) {
-                            Text(chapter.name, color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold)
-                            Text(if (chapter.isZip) "ZIP/CBZ 章节" else "文件夹章节", color = Color(0xFF9A9AA8), fontSize = 12.sp)
-                        }
-                        Button(onClick = { onReadChapter(index) }) {
-                            Text(if (index == lastChapterIndex) "继续" else "阅读")
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxWidth(0.7f)
+                                    .padding(end = 12.dp)
+                            ) {
+                                Text(chapter.name, color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                                Text(if (chapter.isZip) "ZIP/CBZ 章节" else "文件夹章节", color = Color(0xFF9A9AA8), fontSize = 12.sp)
+                            }
+                            Button(onClick = { onReadChapter(index) }) {
+                                Text(if (index == lastChapterIndex) "继续" else "阅读")
+                            }
                         }
                     }
                 }
@@ -639,18 +1310,29 @@ private fun BookDetailScreen(
     }
 
     if (showEditDialog) {
-        EditBookMetadataDialog(
-            book = book,
-            initialMetadata = metadata,
-            onDismiss = { showEditDialog = false },
-            onSaved = {
-                showEditDialog = false
-                onEditFinished()
-            }
-        )
+        if (isExternalOnly) {
+            ExternalBookEditorDialog(
+                existingBook = book,
+                initialMetadata = metadata,
+                onDismiss = { showEditDialog = false },
+                onSaved = {
+                    showEditDialog = false
+                    onEditFinished()
+                }
+            )
+        } else {
+            EditBookMetadataDialog(
+                book = book,
+                initialMetadata = metadata,
+                onDismiss = { showEditDialog = false },
+                onSaved = {
+                    showEditDialog = false
+                    onEditFinished()
+                }
+            )
+        }
     }
 }
-
 @Composable
 private fun EditBookMetadataDialog(
     book: ComicBook,
@@ -666,6 +1348,7 @@ private fun EditBookMetadataDialog(
     var inputTags by remember { mutableStateOf(initialMetadata.tags.joinToString(", ")) }
     var inputCoverPage by remember { mutableStateOf(initialMetadata.coverPage.toString()) }
     var autoNextChapter by remember { mutableStateOf(initialMetadata.autoNextChapter) }
+    var inputExternalUrl by remember { mutableStateOf(initialMetadata.externalUrl) }
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -676,6 +1359,12 @@ private fun EditBookMetadataDialog(
                 TextField(value = inputDesc, onValueChange = { inputDesc = it }, label = { Text("简介") }, modifier = Modifier.fillMaxWidth())
                 TextField(value = inputTags, onValueChange = { inputTags = it }, label = { Text("标签，使用逗号分隔") }, modifier = Modifier.fillMaxWidth())
                 TextField(value = inputCoverPage, onValueChange = { inputCoverPage = it }, label = { Text("封面页码") }, modifier = Modifier.fillMaxWidth())
+                TextField(
+                    value = inputExternalUrl,
+                    onValueChange = { inputExternalUrl = it },
+                    label = { Text("来源网站地址（可选）") },
+                    modifier = Modifier.fillMaxWidth()
+                )
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceBetween,
@@ -696,6 +1385,11 @@ private fun EditBookMetadataDialog(
         confirmButton = {
             Button(
                 onClick = {
+                    val externalUrl = inputExternalUrl.trim()
+                    if (externalUrl.isNotBlank() && !isValidExternalUrl(externalUrl)) {
+                        Toast.makeText(context, "外链地址必须以 http:// 或 https:// 开头", Toast.LENGTH_SHORT).show()
+                        return@Button
+                    }
                     val coverPage = inputCoverPage.toIntOrNull()?.coerceAtLeast(1) ?: 1
                     sharedPrefs.edit {
                         putString("${book.id}_custom_name", inputName.trim().ifEmpty { book.name })
@@ -703,6 +1397,9 @@ private fun EditBookMetadataDialog(
                         putString("${book.id}_tags", normalizeTags(inputTags).joinToString(","))
                         putInt("${book.id}_cover_index", coverPage)
                         putBoolean("${book.id}_auto_next", autoNextChapter)
+                        putBoolean("${book.id}_external_only", false)
+                        putBoolean("${book.id}_open_externally", false)
+                        putString("${book.id}_external_url", externalUrl)
                     }
                     onSaved()
                 }
@@ -713,7 +1410,6 @@ private fun EditBookMetadataDialog(
         }
     )
 }
-
 @Composable
 fun ComicReaderScreen(
     book: ComicBook,
@@ -1165,14 +1861,288 @@ private fun readBookMetadata(sharedPrefs: SharedPreferences, book: ComicBook): B
         ?.map { it.trim() }
         ?.filter { it.isNotBlank() }
         .orEmpty()
+    val isExternalOnly = if (isExternalBookId(book.id)) {
+        sharedPrefs.getBoolean("${book.id}_external_only", true) ||
+            sharedPrefs.getBoolean("${book.id}_open_externally", true)
+    } else {
+        sharedPrefs.getBoolean("${book.id}_external_only", false)
+    }
 
     return BookMetadata(
         customName = sharedPrefs.getString("${book.id}_custom_name", book.name) ?: book.name,
         customDesc = sharedPrefs.getString("${book.id}_custom_desc", defaultDescription(book)) ?: defaultDescription(book),
         tags = savedTags,
         coverPage = sharedPrefs.getInt("${book.id}_cover_index", 1).coerceAtLeast(1),
-        autoNextChapter = sharedPrefs.getBoolean("${book.id}_auto_next", false)
+        autoNextChapter = sharedPrefs.getBoolean("${book.id}_auto_next", false),
+        openExternally = isExternalOnly,
+        externalUrl = sharedPrefs.getString("${book.id}_external_url", "")?.trim().orEmpty(),
+        customCoverUri = sharedPrefs.getString("${book.id}_custom_cover_uri", "")?.trim().orEmpty()
     )
+}
+
+private fun loadExternalBooks(sharedPrefs: SharedPreferences): List<ComicBook> {
+    return loadExternalBookEntries(sharedPrefs).map { entry ->
+        ComicBook(
+            id = entry.id,
+            name = sharedPrefs.getString("${entry.id}_custom_name", entry.seedName) ?: entry.seedName,
+            uri = Uri.EMPTY,
+            description = sharedPrefs.getString("${entry.id}_custom_desc", "外链漫画") ?: "外链漫画",
+            chapters = emptyList()
+        )
+    }
+}
+
+private fun loadExternalBookEntries(sharedPrefs: SharedPreferences): List<ExternalBookEntry> {
+    val raw = sharedPrefs.getString(EXTERNAL_BOOKS_PREF_KEY, null).orEmpty()
+    if (raw.isBlank()) return emptyList()
+
+    return try {
+        val jsonArray = JSONArray(raw)
+        buildList {
+            for (index in 0 until jsonArray.length()) {
+                val item = jsonArray.optJSONObject(index) ?: continue
+                val id = item.optString("id").trim()
+                val name = item.optString("name").trim()
+                if (id.isNotBlank() && name.isNotBlank()) {
+                    add(ExternalBookEntry(id = id, seedName = name))
+                }
+            }
+        }
+    } catch (_: Exception) {
+        emptyList()
+    }
+}
+
+private fun upsertExternalBookEntry(sharedPrefs: SharedPreferences, entry: ExternalBookEntry) {
+    val currentEntries = loadExternalBookEntries(sharedPrefs).toMutableList()
+    val existingIndex = currentEntries.indexOfFirst { it.id == entry.id }
+    if (existingIndex >= 0) {
+        currentEntries[existingIndex] = entry
+    } else {
+        currentEntries += entry
+    }
+
+    val jsonArray = JSONArray()
+    currentEntries.forEach { current ->
+        jsonArray.put(
+            JSONObject().apply {
+                put("id", current.id)
+                put("name", current.seedName)
+            }
+        )
+    }
+    sharedPrefs.edit { putString(EXTERNAL_BOOKS_PREF_KEY, jsonArray.toString()) }
+}
+
+private fun removeExternalBookEntry(sharedPrefs: SharedPreferences, bookId: String) {
+    val jsonArray = JSONArray()
+    loadExternalBookEntries(sharedPrefs)
+        .filterNot { it.id == bookId }
+        .forEach { current ->
+            jsonArray.put(
+                JSONObject().apply {
+                    put("id", current.id)
+                    put("name", current.seedName)
+                }
+            )
+        }
+    sharedPrefs.edit { putString(EXTERNAL_BOOKS_PREF_KEY, jsonArray.toString()) }
+}
+
+private suspend fun deleteComicBook(
+    context: Context,
+    sharedPrefs: SharedPreferences,
+    book: ComicBook
+): Boolean = withContext(Dispatchers.IO) {
+    if (isExternalBookId(book.id)) {
+        removeExternalBookEntry(sharedPrefs, book.id)
+        clearBookMetadata(sharedPrefs, book.id)
+        return@withContext true
+    }
+
+    val deleted = DocumentFile.fromSingleUri(context, book.uri)?.delete() == true
+    if (deleted) {
+        clearBookMetadata(sharedPrefs, book.id)
+    }
+    deleted
+}
+
+private fun clearBookMetadata(sharedPrefs: SharedPreferences, bookId: String) {
+    sharedPrefs.edit {
+        remove("${bookId}_custom_name")
+        remove("${bookId}_custom_desc")
+        remove("${bookId}_tags")
+        remove("${bookId}_cover_index")
+        remove("${bookId}_auto_next")
+        remove("${bookId}_external_only")
+        remove("${bookId}_open_externally")
+        remove("${bookId}_external_url")
+        remove("${bookId}_custom_cover_uri")
+        remove("${bookId}_last_chapter_id")
+    }
+}
+
+private fun saveCoverToAppStorage(context: Context, sourceUri: Uri): String? {
+    return try {
+        val coverDirectory = File(context.filesDir, "external_covers").apply { mkdirs() }
+        val targetFile = File(coverDirectory, "cover_${UUID.randomUUID()}.jpg")
+        context.contentResolver.openInputStream(sourceUri)?.use { inputStream ->
+            FileOutputStream(targetFile).use { outputStream ->
+                inputStream.copyTo(outputStream)
+            }
+        } ?: return null
+        Uri.fromFile(targetFile).toString()
+    } catch (_: Exception) {
+        null
+    }
+}
+
+private fun resolveStoredCoverModel(storedCoverUri: String): Any {
+    val uri = Uri.parse(storedCoverUri)
+    return if (uri.scheme == "file") {
+        File(uri.path.orEmpty())
+    } else {
+        uri
+    }
+}
+
+private suspend fun syncBookshelfAssets(
+    context: Context,
+    rootFolderUri: Uri,
+    books: List<ComicBook>,
+    metadataMap: Map<String, BookMetadata>
+) = withContext(Dispatchers.IO) {
+    val rootDirectory = DocumentFile.fromTreeUri(context, rootFolderUri) ?: return@withContext
+    books.forEach { book ->
+        val metadata = metadataMap[book.id] ?: return@forEach
+        syncSingleBookAssets(context, rootDirectory, book, metadata)
+    }
+}
+
+private suspend fun syncSingleBookAssets(
+    context: Context,
+    rootDirectory: DocumentFile,
+    book: ComicBook,
+    metadata: BookMetadata
+) {
+    if (book.chapters.isEmpty()) return
+
+    val folderName = sanitizeDocumentName(metadata.customName.ifBlank { book.name })
+    val bookDirectory = rootDirectory.findFile(folderName)?.takeIf { it.isDirectory }
+        ?: rootDirectory.createDirectory(folderName)
+        ?: return
+
+    if (metadata.externalUrl.isNotBlank()) {
+        writeTextDocument(context, bookDirectory, "source_url.txt", metadata.externalUrl)
+    } else {
+        bookDirectory.findFile("source_url.txt")?.delete()
+    }
+
+    val coverBitmap = resolveBookCoverBitmap(context, book, metadata)
+    if (coverBitmap != null) {
+        writeBitmapDocument(context, bookDirectory, "cover.jpg", coverBitmap)
+        coverBitmap.recycle()
+    } else {
+        bookDirectory.findFile("cover.jpg")?.delete()
+    }
+}
+
+private suspend fun resolveBookCoverBitmap(
+    context: Context,
+    book: ComicBook,
+    metadata: BookMetadata
+): Bitmap? = withContext(Dispatchers.IO) {
+    if (metadata.customCoverUri.isNotBlank()) {
+        return@withContext try {
+            val coverUri = Uri.parse(metadata.customCoverUri)
+            if (coverUri.scheme == "file") {
+                BitmapFactory.decodeFile(coverUri.path)
+            } else {
+                context.contentResolver.openInputStream(coverUri)?.use(BitmapFactory::decodeStream)
+            }
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    if (book.chapters.isEmpty()) return@withContext null
+
+    val cacheZipFile = File(context.cacheDir, "sync_cover_${book.id.hashCode()}.zip")
+    when (val cover = ComicParser.getBookCover(context, book, cacheZipFile, metadata.coverPage - 1)) {
+        is Bitmap -> cover
+        is File -> BitmapFactory.decodeFile(cover.absolutePath)
+        is Uri -> {
+            try {
+                context.contentResolver.openInputStream(cover)?.use(BitmapFactory::decodeStream)
+            } catch (_: Exception) {
+                null
+            }
+        }
+        else -> null
+    }
+}
+
+private fun writeTextDocument(context: Context, directory: DocumentFile, fileName: String, content: String) {
+    val file = prepareChildFile(directory, fileName, "text/plain") ?: return
+    try {
+        context.contentResolver.openOutputStream(file.uri, "wt")?.bufferedWriter()?.use { writer ->
+            writer.write(content)
+        }
+    } catch (_: Exception) {
+    }
+}
+
+private fun writeBitmapDocument(context: Context, directory: DocumentFile, fileName: String, bitmap: Bitmap) {
+    val file = prepareChildFile(directory, fileName, "image/jpeg") ?: return
+    try {
+        context.contentResolver.openOutputStream(file.uri, "w")?.use { outputStream ->
+            bitmap.compress(Bitmap.CompressFormat.JPEG, 90, outputStream)
+        }
+    } catch (_: Exception) {
+    }
+}
+
+private fun prepareChildFile(directory: DocumentFile, fileName: String, mimeType: String): DocumentFile? {
+    directory.findFile(fileName)?.let { existing ->
+        if (existing.isDirectory) return null
+        existing.delete()
+    }
+    return directory.createFile(mimeType, fileName)
+}
+
+private fun sanitizeDocumentName(rawName: String): String {
+    val cleaned = rawName.replace(Regex("[\\\\/:*?\"<>|]"), "_").trim()
+    return cleaned.ifBlank { "未命名漫画" }
+}
+
+private fun isValidExternalUrl(url: String): Boolean {
+    return url.startsWith("http://") || url.startsWith("https://")
+}
+
+private fun isExternalBookId(bookId: String): Boolean {
+    return bookId.startsWith(EXTERNAL_BOOK_ID_PREFIX)
+}
+
+private fun openExternalComic(context: Context, url: String) {
+    if (!isValidExternalUrl(url)) {
+        Toast.makeText(context, "链接无效，请先检查外链地址", Toast.LENGTH_SHORT).show()
+        return
+    }
+
+    val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url)).apply {
+        addCategory(Intent.CATEGORY_BROWSABLE)
+        if (context !is Activity) {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+    }
+
+    try {
+        context.startActivity(intent)
+    } catch (_: ActivityNotFoundException) {
+        Toast.makeText(context, "当前设备没有可用于打开该链接的应用", Toast.LENGTH_SHORT).show()
+    } catch (_: Exception) {
+        Toast.makeText(context, "打开链接失败，请检查外链地址或系统默认浏览器", Toast.LENGTH_SHORT).show()
+    }
 }
 
 private fun normalizeTags(rawTags: String): List<String> {
@@ -1194,7 +2164,9 @@ private fun shouldShowDescription(book: ComicBook, metadata: BookMetadata): Bool
 }
 
 private fun defaultDescription(book: ComicBook): String {
-    return if (book.chapters.size > 1) {
+    return if (book.chapters.isEmpty()) {
+        "这本漫画会跳转到外部网站进行阅读。"
+    } else if (book.chapters.size > 1) {
         "这本漫画已按章节整理，共 ${book.chapters.size} 章。"
     } else {
         "这本漫画当前为单章节阅读。"
