@@ -5,6 +5,9 @@ import android.graphics.Bitmap
 import android.net.Uri
 import androidx.activity.ComponentActivity
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.BorderStroke
@@ -53,14 +56,19 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
@@ -71,9 +79,11 @@ import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import coil.compose.AsyncImage
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.io.File
+import kotlin.math.hypot
 
 @Composable
 internal fun ComicReaderScreen(
@@ -169,6 +179,64 @@ internal fun ComicReaderScreen(
     val autoNextChapter = metadata.autoNextChapter
 
     key(currentChapter.id, isVerticalMode) {
+        var readerScale by remember(currentChapter.id, isVerticalMode) { mutableFloatStateOf(1f) }
+        var readerOffsetX by remember(currentChapter.id, isVerticalMode) { mutableFloatStateOf(0f) }
+        var readerOffsetY by remember(currentChapter.id, isVerticalMode) { mutableFloatStateOf(0f) }
+        var readerViewportSize by remember(currentChapter.id, isVerticalMode) { mutableStateOf(IntSize.Zero) }
+        var zoomAnimationJob by remember(currentChapter.id, isVerticalMode) { mutableStateOf<Job?>(null) }
+        fun resetReaderZoom() {
+            zoomAnimationJob?.cancel()
+            readerScale = 1f
+            readerOffsetX = 0f
+            readerOffsetY = 0f
+        }
+        fun animateReaderZoomTo(targetScale: Float, targetOffsetX: Float = 0f, targetOffsetY: Float = 0f) {
+            zoomAnimationJob?.cancel()
+            val startScale = readerScale
+            val startOffsetX = readerOffsetX
+            val startOffsetY = readerOffsetY
+            zoomAnimationJob = scope.launch {
+                Animatable(0f).animateTo(
+                    targetValue = 1f,
+                    animationSpec = tween(durationMillis = 240, easing = FastOutSlowInEasing)
+                ) {
+                    readerScale = lerpFloat(startScale, targetScale, value)
+                    readerOffsetX = lerpFloat(startOffsetX, targetOffsetX, value)
+                    readerOffsetY = lerpFloat(startOffsetY, targetOffsetY, value)
+                }
+                readerScale = targetScale
+                readerOffsetX = targetOffsetX
+                readerOffsetY = targetOffsetY
+                zoomAnimationJob = null
+            }
+        }
+        fun clampReaderOffset(scale: Float, offsetX: Float, offsetY: Float): Offset {
+            if (scale <= 1f || readerViewportSize == IntSize.Zero) return Offset.Zero
+            val maxOffsetX = readerViewportSize.width * (scale - 1f) / 2f
+            val maxOffsetY = readerViewportSize.height * (scale - 1f) / 2f
+            return Offset(
+                x = offsetX.coerceIn(-maxOffsetX, maxOffsetX),
+                y = offsetY.coerceIn(-maxOffsetY, maxOffsetY)
+            )
+        }
+        fun updateReaderZoom(zoomChange: Float, panChange: Offset) {
+            zoomAnimationJob?.cancel()
+            zoomAnimationJob = null
+            val newScale = (readerScale * zoomChange).coerceIn(1f, 4f)
+            if (newScale == 1f) {
+                resetReaderZoom()
+            } else {
+                val scaleRatio = newScale / readerScale
+                readerScale = newScale
+                val clampedOffset = clampReaderOffset(
+                    scale = newScale,
+                    offsetX = (readerOffsetX + panChange.x) * scaleRatio,
+                    offsetY = (readerOffsetY + panChange.y) * scaleRatio
+                )
+                readerOffsetX = clampedOffset.x
+                readerOffsetY = clampedOffset.y
+            }
+        }
         val pagerState = rememberPagerState(initialPage = savedPage, pageCount = { totalPages })
         val listState = rememberLazyListState(initialFirstVisibleItemIndex = savedPage)
         val currentPageIndex = if (isVerticalMode) {
@@ -195,6 +263,19 @@ internal fun ComicReaderScreen(
             modifier = Modifier
                 .fillMaxSize()
                 .background(Color.Black)
+                .onSizeChanged { readerViewportSize = it }
+                .readerZoomGestures(
+                    scale = readerScale,
+                    onTransform = ::updateReaderZoom,
+                    onDoubleTap = {
+                        if (readerScale > 1f) {
+                            animateReaderZoomTo(1f)
+                        } else {
+                            animateReaderZoomTo(2.5f)
+                        }
+                    },
+                    onTap = { showControls = !showControls }
+                )
                 .pointerInput(onBack) {
                     var startX = 0f
                     var totalDrag = 0f
@@ -222,20 +303,41 @@ internal fun ComicReaderScreen(
                         }
                     )
                 }
-                .pointerInput(Unit) { detectTapGestures(onTap = { showControls = !showControls }) }
         ) {
             if (isVerticalMode) {
                 LazyColumn(
                     state = listState,
-                    modifier = Modifier.fillMaxSize(),
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .graphicsLayer {
+                            scaleX = readerScale
+                            scaleY = readerScale
+                            translationX = readerOffsetX
+                            translationY = readerOffsetY
+                        },
                     verticalArrangement = Arrangement.spacedBy(if (hasPageGap) 10.dp else 0.dp)
                 ) {
                     itemsIndexed(chapterPages, key = { index, _ -> "${currentChapter.id}#$index" }) { _, page ->
-                        ReaderImage(page = page, isFolder = !currentChapter.isZip, cacheZipFile = cacheZipFile, isFullScreen = false)
+                        ReaderImage(
+                            page = page,
+                            isFolder = !currentChapter.isZip,
+                            cacheZipFile = cacheZipFile,
+                            isFullScreen = false
+                        )
                     }
                 }
             } else {
-                HorizontalPager(state = pagerState, modifier = Modifier.fillMaxSize()) { pageIndex ->
+                HorizontalPager(
+                    state = pagerState,
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .graphicsLayer {
+                            scaleX = readerScale
+                            scaleY = readerScale
+                            translationX = readerOffsetX
+                            translationY = readerOffsetY
+                        }
+                ) { pageIndex ->
                     ReaderImage(
                         page = chapterPages[pageIndex],
                         isFolder = !currentChapter.isZip,
@@ -481,6 +583,73 @@ private fun ToolbarChipButton(
 }
 
 @Composable
+private fun Modifier.readerZoomGestures(
+    scale: Float,
+    onTransform: (Float, Offset) -> Unit,
+    onDoubleTap: () -> Unit,
+    onTap: () -> Unit
+): Modifier {
+    val currentScale by rememberUpdatedState(scale)
+    return this.pointerInput(Unit) {
+        awaitPointerEventScope {
+            var previousCentroid: Offset? = null
+            var previousDistance = 0f
+            while (true) {
+                val event = awaitPointerEvent()
+                val pressedChanges = event.changes.filter { it.pressed }
+                when {
+                    pressedChanges.size >= 2 -> {
+                        val positions = pressedChanges.map { it.position }
+                        val centroid = positions.centroid()
+                        val distance = positions.averageDistanceTo(centroid)
+                        val previous = previousCentroid
+                        if (previous != null && previousDistance > 0f) {
+                            val zoomChange = (distance / previousDistance).takeIf { it.isFinite() && it > 0f } ?: 1f
+                            onTransform(zoomChange, centroid - previous)
+                        }
+                        previousCentroid = centroid
+                        previousDistance = distance
+                        pressedChanges.forEach { it.consume() }
+                    }
+                    currentScale > 1f && pressedChanges.size == 1 -> {
+                        val change = pressedChanges.first()
+                        onTransform(1f, change.position - change.previousPosition)
+                        change.consume()
+                        previousCentroid = null
+                        previousDistance = 0f
+                    }
+                    else -> {
+                        previousCentroid = null
+                        previousDistance = 0f
+                    }
+                }
+            }
+        }
+    }
+    .pointerInput(scale) {
+        detectTapGestures(
+            onTap = { onTap() },
+            onDoubleTap = { onDoubleTap() }
+        )
+    }
+}
+
+private fun lerpFloat(start: Float, stop: Float, fraction: Float): Float {
+    return start + (stop - start) * fraction
+}
+
+private fun List<Offset>.centroid(): Offset {
+    if (isEmpty()) return Offset.Zero
+    val sum = fold(Offset.Zero) { acc, offset -> acc + offset }
+    return sum / size.toFloat()
+}
+
+private fun List<Offset>.averageDistanceTo(center: Offset): Float {
+    if (isEmpty()) return 0f
+    return map { offset -> hypot(offset.x - center.x, offset.y - center.y) }.average().toFloat()
+}
+
+@Composable
 private fun ReaderImage(
     page: Any,
     isFolder: Boolean,
@@ -488,6 +657,12 @@ private fun ReaderImage(
     modifier: Modifier = Modifier,
     isFullScreen: Boolean
 ) {
+    val sizedImageModifier = if (isFullScreen) {
+        Modifier.fillMaxSize()
+    } else {
+        Modifier.fillMaxWidth().wrapContentHeight()
+    }
+
     Box(
         modifier = if (isFullScreen) {
             modifier.fillMaxSize().background(Color(0xFF0D0D12))
@@ -500,7 +675,7 @@ private fun ReaderImage(
             AsyncImage(
                 model = page as Uri,
                 contentDescription = null,
-                modifier = if (isFullScreen) Modifier.fillMaxSize() else Modifier.fillMaxWidth().wrapContentHeight(),
+                modifier = sizedImageModifier,
                 contentScale = if (isFullScreen) ContentScale.Fit else ContentScale.FillWidth
             )
         } else {
@@ -512,7 +687,7 @@ private fun ReaderImage(
                 Image(
                     bitmap = loadedBitmap.asImageBitmap(),
                     contentDescription = null,
-                    modifier = if (isFullScreen) Modifier.fillMaxSize() else Modifier.fillMaxWidth().wrapContentHeight(),
+                    modifier = sizedImageModifier,
                     contentScale = if (isFullScreen) ContentScale.Fit else ContentScale.FillWidth
                 )
             } ?: CircularProgressIndicator(color = Color(0xFF333344))
