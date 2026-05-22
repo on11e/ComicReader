@@ -49,6 +49,7 @@ import androidx.compose.material3.TextField
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -103,6 +104,7 @@ private fun LibrarySetupScreen(onPickFolder: () -> Unit) {
 internal fun BookshelfScreen(
     books: List<ComicBook>,
     metadataMap: Map<String, BookMetadata>,
+    comicWebsites: List<ComicWebsite>,
     allTags: List<String>,
     selectedTag: String?,
     isScanning: Boolean,
@@ -112,6 +114,7 @@ internal fun BookshelfScreen(
     onRefreshMetadata: () -> Unit,
     onDeleteBook: suspend (ComicBook) -> Boolean,
     onPickFolder: () -> Unit,
+    onAddFavoriteWebsite: () -> Unit,
     onAddExternalBook: () -> Unit
 ) {
     val context = LocalContext.current
@@ -132,7 +135,28 @@ internal fun BookshelfScreen(
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Text("我的书架", color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.Bold)
+                    Row(
+                        modifier = Modifier.weight(1f),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text("我的书架", color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.Bold)
+                        if (comicWebsites.isNotEmpty()) {
+                            Row(
+                                modifier = Modifier
+                                    .padding(start = 10.dp)
+                                    .horizontalScroll(rememberScrollState()),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                comicWebsites.forEach { website ->
+                                    WebsiteShortcutIcon(
+                                        website = website,
+                                        onClick = { openExternalComic(context, website.url) }
+                                    )
+                                }
+                            }
+                        }
+                    }
                     Box {
                         TextButton(onClick = { showMenu = true }) {
                             Text("☰", color = Color.White, fontSize = 22.sp, fontWeight = FontWeight.Bold)
@@ -154,6 +178,13 @@ internal fun BookshelfScreen(
                                 onClick = {
                                     showMenu = false
                                     onPickFolder()
+                                }
+                            )
+                            DropdownMenuItem(
+                                text = { Text("添加收藏网站", color = Color.White) },
+                                onClick = {
+                                    showMenu = false
+                                    onAddFavoriteWebsite()
                                 }
                             )
                         }
@@ -359,7 +390,7 @@ private fun BookCard(
                     if (metadata.externalUrl.isNotBlank()) {
                         MetaPill(text = "外链", accent = true)
                     }
-                    metadata.tags.filter { it.isNotBlank() && !metadata.openExternally }.forEach { tag ->
+                    metadata.tags.filter { it.isNotBlank() }.forEach { tag ->
                         MetaPill(text = tag, accent = true)
                     }
                 }
@@ -479,6 +510,57 @@ private fun MetaPill(text: String, accent: Boolean = false) {
 }
 
 @Composable
+private fun WebsiteShortcutIcon(
+    website: ComicWebsite,
+    onClick: () -> Unit
+) {
+    val iconCandidates = remember(website.id, website.iconUrl, website.url) {
+        websiteIconUrlCandidates(website.iconUrl, website.url)
+    }
+    var iconIndex by remember(website.id, website.iconUrl, website.url) { mutableIntStateOf(0) }
+    val iconModel = iconCandidates.getOrNull(iconIndex)
+    Box(
+        modifier = Modifier
+            .size(34.dp)
+            .clip(RoundedCornerShape(10.dp))
+            .background(Color(0xFFF2F2F6))
+            .pointerInput(website.id) {
+                detectTapGestures(onTap = { onClick() })
+            },
+        contentAlignment = Alignment.Center
+    ) {
+        val fallbackText = website.name.trim().take(1).ifBlank { "网" }
+        WebsiteIconFallback(fallbackText)
+        AsyncImage(
+            model = iconModel,
+            contentDescription = website.name,
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(6.dp),
+            contentScale = ContentScale.Fit,
+            onError = {
+                if (iconIndex < iconCandidates.lastIndex) {
+                    iconIndex += 1
+                }
+            }
+        )
+    }
+}
+
+@Composable
+private fun WebsiteIconFallback(text: String) {
+    Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+        Text(
+            text = text,
+            color = Color(0xFF12121A),
+            fontSize = 14.sp,
+            fontWeight = FontWeight.Black,
+            maxLines = 1
+        )
+    }
+}
+
+@Composable
 private fun ExternalCoverPlaceholder(title: String) {
     Box(
         modifier = Modifier
@@ -496,6 +578,135 @@ private fun ExternalCoverPlaceholder(title: String) {
 }
 
 @Composable
+internal fun AddFavoriteWebsiteDialog(
+    websites: List<ComicWebsite>,
+    onDismiss: () -> Unit,
+    onWebsitesChanged: () -> Unit
+) {
+    val context = LocalContext.current
+    val sharedPrefs = remember { context.getSharedPreferences("comic_progress_prefs", Context.MODE_PRIVATE) }
+
+    var inputName by remember { mutableStateOf("") }
+    var inputUrl by remember { mutableStateOf("") }
+    var inputIconUrl by remember { mutableStateOf("") }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("添加收藏网站") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text("收藏网站", fontWeight = FontWeight.Bold)
+                TextField(
+                    value = inputName,
+                    onValueChange = { inputName = it },
+                    label = { Text("网站名称") },
+                    modifier = Modifier.fillMaxWidth()
+                )
+                TextField(
+                    value = inputUrl,
+                    onValueChange = { inputUrl = it },
+                    label = { Text("网站地址") },
+                    modifier = Modifier.fillMaxWidth()
+                )
+                TextField(
+                    value = inputIconUrl,
+                    onValueChange = { inputIconUrl = it },
+                    label = { Text("图标地址（可选）") },
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Button(
+                    onClick = {
+                        val name = inputName.trim()
+                        val url = inputUrl.trim()
+                        val iconUrl = inputIconUrl.trim()
+                        if (name.isBlank()) {
+                            Toast.makeText(context, "请先填写网站名称", Toast.LENGTH_SHORT).show()
+                            return@Button
+                        }
+                        if (!isValidExternalUrl(url)) {
+                            Toast.makeText(context, "网站地址必须以 http:// 或 https:// 开头", Toast.LENGTH_SHORT).show()
+                            return@Button
+                        }
+                        if (iconUrl.isNotBlank() && !isValidExternalUrl(iconUrl)) {
+                            Toast.makeText(context, "图标地址必须以 http:// 或 https:// 开头", Toast.LENGTH_SHORT).show()
+                            return@Button
+                        }
+
+                        upsertComicWebsite(
+                            sharedPrefs,
+                            ComicWebsite(
+                                id = UUID.randomUUID().toString(),
+                                name = name,
+                                url = url,
+                                iconUrl = iconUrl
+                            )
+                        )
+                        inputName = ""
+                        inputUrl = ""
+                        inputIconUrl = ""
+                        onWebsitesChanged()
+                    },
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text("添加收藏网站")
+                }
+                if (websites.isNotEmpty()) {
+                    LazyColumn(
+                        modifier = Modifier.height(180.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        itemsIndexed(websites, key = { _, website -> website.id }) { _, website ->
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Row(
+                                    modifier = Modifier.weight(1f),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    WebsiteShortcutIcon(
+                                        website = website,
+                                        onClick = { openExternalComic(context, website.url) }
+                                    )
+                                    Spacer(modifier = Modifier.width(10.dp))
+                                    Column {
+                                        Text(
+                                            text = website.name,
+                                            fontWeight = FontWeight.Bold,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                        Text(
+                                            text = website.url,
+                                            color = Color.Gray,
+                                            fontSize = 12.sp,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                    }
+                                }
+                                TextButton(
+                                    onClick = {
+                                        removeComicWebsite(sharedPrefs, website.id)
+                                        onWebsitesChanged()
+                                    }
+                                ) {
+                                    Text("删除", color = Color(0xFFE57373))
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onDismiss) { Text("完成") }
+        }
+    )
+}
+
+@Composable
 internal fun ExternalBookEditorDialog(
     existingBook: ComicBook? = null,
     initialMetadata: BookMetadata? = null,
@@ -507,6 +718,7 @@ internal fun ExternalBookEditorDialog(
 
     var inputName by remember { mutableStateOf(initialMetadata?.customName ?: "") }
     var inputDesc by remember { mutableStateOf(initialMetadata?.customDesc ?: "这本漫画会跳转到外部网站进行阅读。") }
+    var inputTags by remember { mutableStateOf(initialMetadata?.tags?.joinToString(", ").orEmpty()) }
     var inputExternalUrl by remember { mutableStateOf(initialMetadata?.externalUrl.orEmpty()) }
     var inputCoverUri by remember { mutableStateOf(initialMetadata?.customCoverUri.orEmpty()) }
     val imagePicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
@@ -525,6 +737,7 @@ internal fun ExternalBookEditorDialog(
                 TextField(value = inputName, onValueChange = { inputName = it }, label = { Text("漫画名称") }, modifier = Modifier.fillMaxWidth())
                 TextField(value = inputExternalUrl, onValueChange = { inputExternalUrl = it }, label = { Text("来源网站地址") }, modifier = Modifier.fillMaxWidth())
                 TextField(value = inputDesc, onValueChange = { inputDesc = it }, label = { Text("简介") }, modifier = Modifier.fillMaxWidth())
+                TextField(value = inputTags, onValueChange = { inputTags = it }, label = { Text("标签，使用逗号分隔") }, modifier = Modifier.fillMaxWidth())
                 Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF1B1B25)), border = BorderStroke(1.dp, Color(0xFF303041))) {
                     Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                         Text("自定义封面", color = Color.White, fontWeight = FontWeight.Bold)
@@ -563,7 +776,7 @@ internal fun ExternalBookEditorDialog(
                     sharedPrefs.edit {
                         putString("${bookId}_custom_name", name)
                         putString("${bookId}_custom_desc", inputDesc.trim().ifBlank { "这本漫画会跳转到外部网站进行阅读。" })
-                        putString("${bookId}_tags", "")
+                        putString("${bookId}_tags", normalizeTags(inputTags).joinToString(","))
                         putInt("${bookId}_cover_index", 1)
                         putBoolean("${bookId}_auto_next", false)
                         putBoolean("${bookId}_external_only", true)
@@ -648,7 +861,7 @@ internal fun BookDetailScreen(
                             if (hasExternalUrl) {
                                 MetaPill(text = "在线阅读", accent = true)
                             }
-                            metadata.tags.filter { it.isNotBlank() && !metadata.openExternally }.forEach { tag ->
+                            metadata.tags.filter { it.isNotBlank() }.forEach { tag ->
                                 MetaPill(text = tag, accent = true)
                             }
                         }
