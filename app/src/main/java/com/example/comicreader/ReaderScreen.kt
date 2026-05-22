@@ -126,7 +126,7 @@ internal fun ComicReaderScreen(
                 val controller = WindowCompat.getInsetsController(window, window.decorView)
                 controller.show(WindowInsetsCompat.Type.systemBars())
             }
-            context.cacheDir.listFiles()?.forEach { it.delete() }
+            ComicParser.trimZipCache(context)
         }
     }
 

@@ -4,6 +4,7 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.Uri
+import android.util.LruCache
 import androidx.documentfile.provider.DocumentFile
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -27,6 +28,18 @@ data class ComicBook(
 )
 
 object ComicParser {
+    private const val ZIP_CACHE_MAX_BYTES = 300L * 1024L * 1024L
+    private val managedZipCachePrefixes = listOf("reader_", "cover_", "sync_cover_")
+    private val pageListCacheLock = Any()
+    private val folderPageListCache = mutableMapOf<String, List<Uri>>()
+    private val zipPageListCache = mutableMapOf<String, List<String>>()
+    private val zipBitmapCache = object : LruCache<String, Bitmap>(
+        ((Runtime.getRuntime().maxMemory() / 1024) / 8).toInt().coerceAtLeast(8 * 1024)
+    ) {
+        override fun sizeOf(key: String, value: Bitmap): Int {
+            return (value.byteCount / 1024).coerceAtLeast(1)
+        }
+    }
 
     suspend fun scanBookshelf(context: Context, rootUri: Uri): List<ComicBook> = withContext(Dispatchers.IO) {
         val rootDir = DocumentFile.fromTreeUri(context, rootUri)
@@ -196,19 +209,38 @@ object ComicParser {
             ?: DocumentFile.fromSingleUri(context, folderUri)
         if (directory == null || !directory.isDirectory) return@withContext emptyList()
 
-        directory.listFiles()
+        val cacheKey = "${folderUri}:${directory.lastModified()}:${directory.length()}"
+        synchronized(pageListCacheLock) {
+            folderPageListCache[cacheKey]?.let { return@withContext it }
+        }
+
+        val pages = directory.listFiles()
             .filter(::isImageFile)
             .map { it.uri }
             .sortedBy { it.toString().lowercase() }
+
+        synchronized(pageListCacheLock) {
+            folderPageListCache[cacheKey] = pages
+        }
+        pages
     }
 
     suspend fun copyZipToCache(context: Context, zipUri: Uri, targetFile: File): Boolean = withContext(Dispatchers.IO) {
         try {
+            val sourceLength = DocumentFile.fromSingleUri(context, zipUri)?.length() ?: -1L
+            if (targetFile.exists() && targetFile.length() > 0L && (sourceLength <= 0L || targetFile.length() == sourceLength)) {
+                targetFile.setLastModified(System.currentTimeMillis())
+                trimZipCache(context, ZIP_CACHE_MAX_BYTES, targetFile)
+                return@withContext true
+            }
+
             context.contentResolver.openInputStream(zipUri)?.use { inputStream ->
                 FileOutputStream(targetFile).use { outputStream ->
                     inputStream.copyTo(outputStream)
                 }
             } ?: return@withContext false
+            targetFile.setLastModified(System.currentTimeMillis())
+            trimZipCache(context, ZIP_CACHE_MAX_BYTES, targetFile)
             true
         } catch (_: Exception) {
             false
@@ -217,12 +249,22 @@ object ComicParser {
 
     suspend fun getPagesFromZip(zipFile: File): List<String> = withContext(Dispatchers.IO) {
         try {
-            ZipFile(zipFile).use { zip ->
+            val cacheKey = zipFile.cacheKey()
+            synchronized(pageListCacheLock) {
+                zipPageListCache[cacheKey]?.let { return@withContext it }
+            }
+
+            val pages = ZipFile(zipFile).use { zip ->
                 zip.entries().toList()
                     .filter { entry -> !entry.isDirectory && isImageName(entry.name) }
                     .map { it.name }
                     .sortedBy { it.lowercase() }
             }
+
+            synchronized(pageListCacheLock) {
+                zipPageListCache[cacheKey] = pages
+            }
+            pages
         } catch (_: Exception) {
             emptyList()
         }
@@ -230,13 +272,54 @@ object ComicParser {
 
     suspend fun getZipPageBitmap(zipFile: File, entryName: String): Bitmap? = withContext(Dispatchers.IO) {
         try {
-            ZipFile(zipFile).use { zip ->
+            val cacheKey = "${zipFile.cacheKey()}:$entryName"
+            zipBitmapCache.get(cacheKey)?.let { return@withContext it }
+
+            val bitmap = ZipFile(zipFile).use { zip ->
                 val entry = zip.getEntry(entryName) ?: return@withContext null
                 zip.getInputStream(entry).use(BitmapFactory::decodeStream)
             }
+            if (bitmap != null) {
+                zipBitmapCache.put(cacheKey, bitmap)
+            }
+            bitmap
         } catch (_: Exception) {
             null
         }
+    }
+
+    private fun File.cacheKey(): String {
+        return "$absolutePath:${lastModified()}:${length()}"
+    }
+
+    fun trimZipCache(context: Context, maxBytes: Long = ZIP_CACHE_MAX_BYTES) {
+        trimZipCache(context, maxBytes, protectedFile = null)
+    }
+
+    private fun trimZipCache(context: Context, maxBytes: Long, protectedFile: File?) {
+        val zipCacheFiles = context.cacheDir.listFiles()
+            ?.filter { file -> file.isManagedZipCacheFile() }
+            .orEmpty()
+        var totalBytes = zipCacheFiles.sumOf { it.length() }
+        if (totalBytes <= maxBytes) return
+
+        val protectedPath = protectedFile?.absolutePath
+        zipCacheFiles
+            .sortedBy { it.lastModified() }
+            .forEach { file ->
+                if (totalBytes <= maxBytes) return
+                if (file.absolutePath == protectedPath) return@forEach
+                val fileBytes = file.length()
+                if (file.delete()) {
+                    totalBytes -= fileBytes
+                }
+            }
+    }
+
+    private fun File.isManagedZipCacheFile(): Boolean {
+        return isFile &&
+            extension.equals("zip", ignoreCase = true) &&
+            managedZipCachePrefixes.any { prefix -> name.startsWith(prefix) }
     }
 
     private fun isArchiveFile(name: String?): Boolean {

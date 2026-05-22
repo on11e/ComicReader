@@ -2,6 +2,7 @@ package com.example.comicreader
 
 import android.content.Context
 import android.graphics.Bitmap
+import android.net.Uri
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -111,7 +112,7 @@ internal fun BookshelfScreen(
     hasLibraryFolder: Boolean,
     onTagSelected: (String?) -> Unit,
     onBookClick: (ComicBook) -> Unit,
-    onRefreshMetadata: () -> Unit,
+    onRefreshMetadata: (ComicBook) -> Unit,
     onDeleteBook: suspend (ComicBook) -> Boolean,
     onPickFolder: () -> Unit,
     onAddFavoriteWebsite: () -> Unit,
@@ -272,7 +273,7 @@ internal fun BookshelfScreen(
                             book = book,
                             metadata = metadataMap[book.id] ?: readBookMetadata(sharedPrefs, book),
                             onClick = { onBookClick(book) },
-                            onMetaChanged = onRefreshMetadata,
+                            onMetaChanged = { onRefreshMetadata(book) },
                             onDelete = onDeleteBook
                         )
                     }
@@ -514,10 +515,31 @@ private fun WebsiteShortcutIcon(
     website: ComicWebsite,
     onClick: () -> Unit
 ) {
-    val iconCandidates = remember(website.id, website.iconUrl, website.url) {
-        websiteIconUrlCandidates(website.iconUrl, website.url)
+    val context = LocalContext.current
+    val sharedPrefs = remember { context.getSharedPreferences("comic_progress_prefs", Context.MODE_PRIVATE) }
+    var cachedIconUri by remember(website.id, website.iconUrl) {
+        mutableStateOf(website.iconUrl.takeIf(::isStoredWebsiteIconAvailable).orEmpty())
     }
-    var iconIndex by remember(website.id, website.iconUrl, website.url) { mutableIntStateOf(0) }
+
+    LaunchedEffect(website.id, website.url, website.iconUrl) {
+        if (cachedIconUri.isBlank()) {
+            val downloadedIconUri = cacheWebsiteIconToAppStorage(
+                context = context,
+                websiteId = website.id,
+                websiteUrl = website.url,
+                customIconUrl = website.iconUrl.takeUnless { Uri.parse(it).scheme == "file" }.orEmpty()
+            )
+            if (!downloadedIconUri.isNullOrBlank()) {
+                cachedIconUri = downloadedIconUri
+                upsertComicWebsite(sharedPrefs, website.copy(iconUrl = downloadedIconUri))
+            }
+        }
+    }
+
+    val iconCandidates = remember(cachedIconUri, website.id, website.iconUrl, website.url) {
+        resolveWebsiteIconModels(cachedIconUri, website.iconUrl, website.url)
+    }
+    var iconIndex by remember(cachedIconUri, website.id, website.iconUrl, website.url) { mutableIntStateOf(0) }
     val iconModel = iconCandidates.getOrNull(iconIndex)
     Box(
         modifier = Modifier
@@ -545,6 +567,30 @@ private fun WebsiteShortcutIcon(
             }
         )
     }
+}
+
+private fun resolveWebsiteIconModels(
+    cachedIconUri: String,
+    savedIconUrl: String,
+    websiteUrl: String
+): List<Any> {
+    val cachedFile = cachedIconUri.toStoredWebsiteIconFile()
+    if (cachedFile != null) return listOf(cachedFile)
+
+    return websiteIconUrlCandidates(savedIconUrl, websiteUrl)
+        .filter { isValidExternalUrl(it) }
+        .map { it as Any }
+}
+
+private fun isStoredWebsiteIconAvailable(iconUri: String): Boolean {
+    return iconUri.toStoredWebsiteIconFile() != null
+}
+
+private fun String.toStoredWebsiteIconFile(): File? {
+    val uri = Uri.parse(this)
+    if (uri.scheme != "file") return null
+    val file = File(uri.path.orEmpty())
+    return file.takeIf { it.isFile && it.length() > 0L }
 }
 
 @Composable
@@ -588,7 +634,16 @@ internal fun AddFavoriteWebsiteDialog(
 
     var inputName by remember { mutableStateOf("") }
     var inputUrl by remember { mutableStateOf("") }
-    var inputIconUrl by remember { mutableStateOf("") }
+    var pickedIconUri by remember { mutableStateOf("") }
+    var isSaving by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
+    val imagePicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) {
+            saveWebsiteIconToAppStorage(context, uri)?.let { storedUri ->
+                pickedIconUri = storedUri
+            } ?: Toast.makeText(context, "图标保存失败，请重新选择图片", Toast.LENGTH_SHORT).show()
+        }
+    }
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -608,17 +663,36 @@ internal fun AddFavoriteWebsiteDialog(
                     label = { Text("网站地址") },
                     modifier = Modifier.fillMaxWidth()
                 )
-                TextField(
-                    value = inputIconUrl,
-                    onValueChange = { inputIconUrl = it },
-                    label = { Text("图标地址（可选）") },
-                    modifier = Modifier.fillMaxWidth()
-                )
+                Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF1B1B25)), border = BorderStroke(1.dp, Color(0xFF303041))) {
+                    Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text("网站图标", color = Color.White, fontWeight = FontWeight.Bold)
+                        Text(
+                            text = if (pickedIconUri.isBlank()) {
+                                "未选择图标。保存时会自动读取网站图标并存到本地。"
+                            } else {
+                                "已选择本地图标"
+                            },
+                            color = Color(0xFFC6C6D4),
+                            fontSize = 12.sp,
+                            lineHeight = 18.sp
+                        )
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            OutlinedButton(onClick = { imagePicker.launch(arrayOf("image/*")) }) { Text("选择图标图片") }
+                            if (pickedIconUri.isNotBlank()) {
+                                OutlinedButton(
+                                    onClick = {
+                                        deleteStoredWebsiteIcon(pickedIconUri)
+                                        pickedIconUri = ""
+                                    }
+                                ) { Text("清除") }
+                            }
+                        }
+                    }
+                }
                 Button(
                     onClick = {
                         val name = inputName.trim()
                         val url = inputUrl.trim()
-                        val iconUrl = inputIconUrl.trim()
                         if (name.isBlank()) {
                             Toast.makeText(context, "请先填写网站名称", Toast.LENGTH_SHORT).show()
                             return@Button
@@ -627,28 +701,43 @@ internal fun AddFavoriteWebsiteDialog(
                             Toast.makeText(context, "网站地址必须以 http:// 或 https:// 开头", Toast.LENGTH_SHORT).show()
                             return@Button
                         }
-                        if (iconUrl.isNotBlank() && !isValidExternalUrl(iconUrl)) {
-                            Toast.makeText(context, "图标地址必须以 http:// 或 https:// 开头", Toast.LENGTH_SHORT).show()
-                            return@Button
-                        }
 
-                        upsertComicWebsite(
-                            sharedPrefs,
-                            ComicWebsite(
-                                id = UUID.randomUUID().toString(),
-                                name = name,
-                                url = url,
-                                iconUrl = iconUrl
-                            )
-                        )
-                        inputName = ""
-                        inputUrl = ""
-                        inputIconUrl = ""
-                        onWebsitesChanged()
+                        scope.launch {
+                            isSaving = true
+                            try {
+                                val websiteId = UUID.randomUUID().toString()
+                                val iconUri = if (pickedIconUri.isNotBlank()) {
+                                    pickedIconUri
+                                } else {
+                                    cacheWebsiteIconToAppStorage(
+                                        context = context,
+                                        websiteId = websiteId,
+                                        websiteUrl = url,
+                                        customIconUrl = ""
+                                    ).orEmpty()
+                                }
+                                upsertComicWebsite(
+                                    sharedPrefs,
+                                    ComicWebsite(
+                                        id = websiteId,
+                                        name = name,
+                                        url = url,
+                                        iconUrl = iconUri
+                                    )
+                                )
+                                inputName = ""
+                                inputUrl = ""
+                                pickedIconUri = ""
+                                onWebsitesChanged()
+                            } finally {
+                                isSaving = false
+                            }
+                        }
                     },
-                    modifier = Modifier.fillMaxWidth()
+                    modifier = Modifier.fillMaxWidth(),
+                    enabled = !isSaving
                 ) {
-                    Text("添加收藏网站")
+                    Text(if (isSaving) "正在保存图标..." else "添加收藏网站")
                 }
                 if (websites.isNotEmpty()) {
                     LazyColumn(
@@ -688,6 +777,7 @@ internal fun AddFavoriteWebsiteDialog(
                                 }
                                 TextButton(
                                     onClick = {
+                                        deleteStoredWebsiteIcon(website.iconUrl)
                                         removeComicWebsite(sharedPrefs, website.id)
                                         onWebsitesChanged()
                                     }

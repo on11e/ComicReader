@@ -17,16 +17,21 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.platform.LocalContext
 import androidx.core.content.edit
 import androidx.documentfile.provider.DocumentFile
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
+import java.net.HttpURLConnection
+import java.net.URL
 import java.util.UUID
 private data class ReaderSession(
     val book: ComicBook,
@@ -61,6 +66,7 @@ internal object NoCoverImage
 internal const val EXTERNAL_BOOK_ID_PREFIX = "external_book::"
 private const val EXTERNAL_BOOKS_PREF_KEY = "external_books"
 private const val COMIC_WEBSITES_PREF_KEY = "comic_websites"
+private const val LOCAL_BOOKS_SNAPSHOT_PREF_KEY = "local_books_snapshot"
 
 @Composable
 internal fun MainAppScreen() {
@@ -77,11 +83,27 @@ internal fun MainAppScreen() {
     var selectedTag by remember { mutableStateOf<String?>(null) }
     var showAddExternalDialog by remember { mutableStateOf(false) }
     var showAddWebsiteDialog by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
 
     fun refreshBookshelf(rescanLocal: Boolean = true) {
         refreshTrigger++
         if (rescanLocal && rootFolderUri != null) {
             isScanning = true
+        }
+    }
+
+    fun syncBookAssetsLater(book: ComicBook) {
+        val folderUri = rootFolderUri ?: return
+        if (book.chapters.isEmpty()) return
+        scope.launch {
+            delay(800)
+            syncBookAssets(
+                context = context,
+                sharedPrefs = sharedPrefs,
+                rootFolderUri = folderUri,
+                book = book,
+                metadata = readBookMetadata(sharedPrefs, book)
+            )
         }
     }
 
@@ -94,6 +116,7 @@ internal fun MainAppScreen() {
             } catch (_: Exception) {
             }
             rootFolderUri = uri
+            localBooks = loadLocalBooksSnapshot(sharedPrefs, uri)
             selectedBook = null
             currentReaderSession = null
             sharedPrefs.edit { putString("saved_root_folder_uri", uri.toString()) }
@@ -104,7 +127,9 @@ internal fun MainAppScreen() {
     LaunchedEffect(Unit) {
         val savedUri = sharedPrefs.getString("saved_root_folder_uri", null)
         if (savedUri != null) {
-            rootFolderUri = Uri.parse(savedUri)
+            val savedRootUri = Uri.parse(savedUri)
+            rootFolderUri = savedRootUri
+            localBooks = loadLocalBooksSnapshot(sharedPrefs, savedRootUri)
             isScanning = true
         }
     }
@@ -112,11 +137,13 @@ internal fun MainAppScreen() {
     LaunchedEffect(rootFolderUri, isScanning, refreshTrigger) {
         if (!isScanning) return@LaunchedEffect
 
-        localBooks = if (rootFolderUri != null) {
+        val scannedBooks = if (rootFolderUri != null) {
             ComicParser.scanBookshelf(context, rootFolderUri!!)
         } else {
             emptyList()
         }
+        localBooks = scannedBooks
+        rootFolderUri?.let { saveLocalBooksSnapshot(sharedPrefs, it, scannedBooks) }
         isScanning = false
     }
 
@@ -151,11 +178,6 @@ internal fun MainAppScreen() {
             selectedTag == null || metadataMap[book.id]?.tags?.contains(selectedTag) == true
         }
     }
-    LaunchedEffect(rootFolderUri, bookshelf, metadataMap) {
-        val folderUri = rootFolderUri ?: return@LaunchedEffect
-        syncBookshelfAssets(context, folderUri, bookshelf, metadataMap)
-    }
-
     when {
         currentReaderSession != null -> ComicReaderScreen(
             book = currentReaderSession!!.book,
@@ -166,7 +188,10 @@ internal fun MainAppScreen() {
             book = selectedBook!!,
             metadata = metadataMap[selectedBook!!.id] ?: readBookMetadata(sharedPrefs, selectedBook!!),
             onBack = { selectedBook = null },
-            onEditFinished = { refreshBookshelf(rescanLocal = false) },
+            onEditFinished = {
+                selectedBook?.let(::syncBookAssetsLater)
+                refreshBookshelf(rescanLocal = false)
+            },
             onReadChapter = { chapterIndex ->
                 currentReaderSession = ReaderSession(selectedBook!!, chapterIndex)
             }
@@ -177,13 +202,16 @@ internal fun MainAppScreen() {
             comicWebsites = comicWebsites,
             allTags = allTags,
             selectedTag = selectedTag,
-            isScanning = isScanning,
+            isScanning = isScanning && filteredBooks.isEmpty(),
             hasLibraryFolder = rootFolderUri != null,
             onTagSelected = { selectedTag = it },
             onBookClick = { book ->
                 selectedBook = book
             },
-            onRefreshMetadata = { refreshBookshelf(rescanLocal = false) },
+            onRefreshMetadata = { book ->
+                syncBookAssetsLater(book)
+                refreshBookshelf(rescanLocal = false)
+            },
             onDeleteBook = { book ->
                 val deleted = deleteComicBook(context, sharedPrefs, book)
                 if (deleted) {
@@ -288,6 +316,96 @@ private fun saveComicWebsites(sharedPrefs: SharedPreferences, websites: List<Com
     }
     sharedPrefs.edit { putString(COMIC_WEBSITES_PREF_KEY, jsonArray.toString()) }
 }
+
+private fun loadLocalBooksSnapshot(sharedPrefs: SharedPreferences, rootFolderUri: Uri): List<ComicBook> {
+    val raw = sharedPrefs.getString(LOCAL_BOOKS_SNAPSHOT_PREF_KEY, null).orEmpty()
+    if (raw.isBlank()) return emptyList()
+
+    return try {
+        val root = JSONObject(raw)
+        if (root.optString("rootUri") != rootFolderUri.toString()) return emptyList()
+        val booksArray = root.optJSONArray("books") ?: return emptyList()
+        buildList {
+            for (bookIndex in 0 until booksArray.length()) {
+                val bookObject = booksArray.optJSONObject(bookIndex) ?: continue
+                val bookId = bookObject.optString("id")
+                val bookName = bookObject.optString("name")
+                val bookUri = bookObject.optString("uri")
+                if (bookId.isBlank() || bookName.isBlank() || bookUri.isBlank()) continue
+
+                val chaptersArray = bookObject.optJSONArray("chapters") ?: JSONArray()
+                val chapters = buildList {
+                    for (chapterIndex in 0 until chaptersArray.length()) {
+                        val chapterObject = chaptersArray.optJSONObject(chapterIndex) ?: continue
+                        val chapterId = chapterObject.optString("id")
+                        val chapterName = chapterObject.optString("name")
+                        val chapterUri = chapterObject.optString("sourceUri")
+                        if (chapterId.isBlank() || chapterName.isBlank() || chapterUri.isBlank()) continue
+                        add(
+                            ComicChapter(
+                                id = chapterId,
+                                name = chapterName,
+                                sourceUri = Uri.parse(chapterUri),
+                                isZip = chapterObject.optBoolean("isZip", false)
+                            )
+                        )
+                    }
+                }
+
+                if (chapters.isNotEmpty()) {
+                    add(
+                        ComicBook(
+                            id = bookId,
+                            name = bookName,
+                            uri = Uri.parse(bookUri),
+                            description = bookObject.optString("description"),
+                            chapters = chapters
+                        )
+                    )
+                }
+            }
+        }
+    } catch (_: Exception) {
+        emptyList()
+    }
+}
+
+private fun saveLocalBooksSnapshot(
+    sharedPrefs: SharedPreferences,
+    rootFolderUri: Uri,
+    books: List<ComicBook>
+) {
+    val booksArray = JSONArray()
+    books.forEach { book ->
+        val chaptersArray = JSONArray()
+        book.chapters.forEach { chapter ->
+            chaptersArray.put(
+                JSONObject().apply {
+                    put("id", chapter.id)
+                    put("name", chapter.name)
+                    put("sourceUri", chapter.sourceUri.toString())
+                    put("isZip", chapter.isZip)
+                }
+            )
+        }
+        booksArray.put(
+            JSONObject().apply {
+                put("id", book.id)
+                put("name", book.name)
+                put("uri", book.uri.toString())
+                put("description", book.description)
+                put("chapters", chaptersArray)
+            }
+        )
+    }
+
+    val root = JSONObject().apply {
+        put("rootUri", rootFolderUri.toString())
+        put("books", booksArray)
+    }
+    sharedPrefs.edit { putString(LOCAL_BOOKS_SNAPSHOT_PREF_KEY, root.toString()) }
+}
+
 internal fun readBookMetadata(sharedPrefs: SharedPreferences, book: ComicBook): BookMetadata {
     val savedTags = sharedPrefs.getString("${book.id}_tags", null)
         ?.split(",")
@@ -430,6 +548,73 @@ internal fun saveCoverToAppStorage(context: Context, sourceUri: Uri): String? {
     }
 }
 
+internal fun saveWebsiteIconToAppStorage(context: Context, sourceUri: Uri): String? {
+    return try {
+        val iconDirectory = File(context.filesDir, "website_icons").apply { mkdirs() }
+        val targetFile = File(iconDirectory, "icon_${UUID.randomUUID()}.png")
+        context.contentResolver.openInputStream(sourceUri)?.use { inputStream ->
+            FileOutputStream(targetFile).use { outputStream ->
+                inputStream.copyTo(outputStream)
+            }
+        } ?: return null
+        Uri.fromFile(targetFile).toString()
+    } catch (_: Exception) {
+        null
+    }
+}
+
+internal suspend fun cacheWebsiteIconToAppStorage(
+    context: Context,
+    websiteId: String,
+    websiteUrl: String,
+    customIconUrl: String
+): String? = withContext(Dispatchers.IO) {
+    val iconDirectory = File(context.filesDir, "website_icons").apply { mkdirs() }
+    websiteIconUrlCandidates(customIconUrl, websiteUrl)
+        .filter { isValidExternalUrl(it) }
+        .forEachIndexed { index, iconUrl ->
+            val targetFile = File(iconDirectory, "icon_${websiteId}_${index}.img")
+            if (downloadWebsiteIcon(iconUrl, targetFile)) {
+                return@withContext Uri.fromFile(targetFile).toString()
+            }
+            targetFile.delete()
+        }
+    null
+}
+
+private fun downloadWebsiteIcon(iconUrl: String, targetFile: File): Boolean {
+    var connection: HttpURLConnection? = null
+    return try {
+        val openedConnection = (URL(iconUrl).openConnection() as HttpURLConnection).apply {
+            connectTimeout = 8_000
+            readTimeout = 8_000
+            instanceFollowRedirects = true
+            setRequestProperty("User-Agent", "Mozilla/5.0")
+        }
+        connection = openedConnection
+        if (openedConnection.responseCode !in 200..299) return false
+        openedConnection.inputStream.use { inputStream ->
+            FileOutputStream(targetFile).use { outputStream ->
+                inputStream.copyTo(outputStream)
+            }
+        }
+        targetFile.length() > 0L
+    } catch (_: Exception) {
+        false
+    } finally {
+        connection?.disconnect()
+    }
+}
+
+internal fun deleteStoredWebsiteIcon(iconUri: String) {
+    val uri = Uri.parse(iconUri)
+    if (uri.scheme != "file") return
+    val file = File(uri.path.orEmpty())
+    if (file.parentFile?.name == "website_icons") {
+        file.delete()
+    }
+}
+
 internal fun resolveStoredCoverModel(storedCoverUri: String): Any {
     val uri = Uri.parse(storedCoverUri)
     return if (uri.scheme == "file") {
@@ -439,26 +624,29 @@ internal fun resolveStoredCoverModel(storedCoverUri: String): Any {
     }
 }
 
-private suspend fun syncBookshelfAssets(
+private suspend fun syncBookAssets(
     context: Context,
+    sharedPrefs: SharedPreferences,
     rootFolderUri: Uri,
-    books: List<ComicBook>,
-    metadataMap: Map<String, BookMetadata>
+    book: ComicBook,
+    metadata: BookMetadata
 ) = withContext(Dispatchers.IO) {
     val rootDirectory = DocumentFile.fromTreeUri(context, rootFolderUri) ?: return@withContext
-    books.forEach { book ->
-        val metadata = metadataMap[book.id] ?: return@forEach
-        syncSingleBookAssets(context, rootDirectory, book, metadata)
-    }
+    syncSingleBookAssets(context, sharedPrefs, rootDirectory, book, metadata)
 }
 
 private suspend fun syncSingleBookAssets(
     context: Context,
+    sharedPrefs: SharedPreferences,
     rootDirectory: DocumentFile,
     book: ComicBook,
     metadata: BookMetadata
 ) {
     if (book.chapters.isEmpty()) return
+
+    val syncSignature = bookAssetSyncSignature(book, metadata)
+    val syncKey = "${book.id}_asset_sync_signature"
+    if (sharedPrefs.getString(syncKey, null) == syncSignature) return
 
     val folderName = sanitizeDocumentName(metadata.customName.ifBlank { book.name })
     val bookDirectory = rootDirectory.findFile(folderName)?.takeIf { it.isDirectory }
@@ -478,6 +666,22 @@ private suspend fun syncSingleBookAssets(
     } else {
         bookDirectory.findFile("cover.jpg")?.delete()
     }
+
+    sharedPrefs.edit { putString(syncKey, syncSignature) }
+}
+
+private fun bookAssetSyncSignature(book: ComicBook, metadata: BookMetadata): String {
+    val chapterSignature = book.chapters.joinToString(separator = "|") { chapter ->
+        "${chapter.id},${chapter.sourceUri},${chapter.isZip}"
+    }
+    return listOf(
+        book.id,
+        metadata.customName,
+        metadata.coverPage.toString(),
+        metadata.externalUrl,
+        metadata.customCoverUri,
+        chapterSignature
+    ).joinToString(separator = "||")
 }
 
 private suspend fun resolveBookCoverBitmap(
