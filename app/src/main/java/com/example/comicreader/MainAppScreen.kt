@@ -49,10 +49,18 @@ internal data class ExternalBookEntry(
     val seedName: String
 )
 
+internal data class ComicWebsite(
+    val id: String,
+    val name: String,
+    val url: String,
+    val iconUrl: String
+)
+
 internal object NoCoverImage
 
 internal const val EXTERNAL_BOOK_ID_PREFIX = "external_book::"
 private const val EXTERNAL_BOOKS_PREF_KEY = "external_books"
+private const val COMIC_WEBSITES_PREF_KEY = "comic_websites"
 
 @Composable
 internal fun MainAppScreen() {
@@ -65,8 +73,10 @@ internal fun MainAppScreen() {
     var currentReaderSession by remember { mutableStateOf<ReaderSession?>(null) }
     var isScanning by remember { mutableStateOf(false) }
     var refreshTrigger by remember { mutableIntStateOf(0) }
+    var websiteRefreshTrigger by remember { mutableIntStateOf(0) }
     var selectedTag by remember { mutableStateOf<String?>(null) }
     var showAddExternalDialog by remember { mutableStateOf(false) }
+    var showAddWebsiteDialog by remember { mutableStateOf(false) }
 
     fun refreshBookshelf(rescanLocal: Boolean = true) {
         refreshTrigger++
@@ -112,6 +122,9 @@ internal fun MainAppScreen() {
 
     val externalBooks = remember(refreshTrigger) {
         loadExternalBooks(sharedPrefs)
+    }
+    val comicWebsites = remember(websiteRefreshTrigger) {
+        loadComicWebsites(sharedPrefs)
     }
     val bookshelf = remember(localBooks, externalBooks, refreshTrigger) {
         (localBooks + externalBooks).sortedBy { book ->
@@ -161,6 +174,7 @@ internal fun MainAppScreen() {
         else -> BookshelfScreen(
             books = filteredBooks,
             metadataMap = metadataMap,
+            comicWebsites = comicWebsites,
             allTags = allTags,
             selectedTag = selectedTag,
             isScanning = isScanning,
@@ -180,12 +194,23 @@ internal fun MainAppScreen() {
                 deleted
             },
             onPickFolder = { libraryLauncher.launch(null) },
+            onAddFavoriteWebsite = { showAddWebsiteDialog = true },
             onAddExternalBook = {
                 if (rootFolderUri == null) {
                     Toast.makeText(context, "请先选择漫画目录", Toast.LENGTH_SHORT).show()
                 } else {
                     showAddExternalDialog = true
                 }
+            }
+        )
+    }
+
+    if (showAddWebsiteDialog) {
+        AddFavoriteWebsiteDialog(
+            websites = comicWebsites,
+            onDismiss = { showAddWebsiteDialog = false },
+            onWebsitesChanged = {
+                websiteRefreshTrigger++
             }
         )
     }
@@ -199,6 +224,69 @@ internal fun MainAppScreen() {
             }
         )
     }
+}
+
+internal fun loadComicWebsites(sharedPrefs: SharedPreferences): List<ComicWebsite> {
+    val raw = sharedPrefs.getString(COMIC_WEBSITES_PREF_KEY, null).orEmpty()
+    if (raw.isBlank()) return emptyList()
+
+    return try {
+        val jsonArray = JSONArray(raw)
+        buildList {
+            for (index in 0 until jsonArray.length()) {
+                val item = jsonArray.optJSONObject(index) ?: continue
+                val id = item.optString("id").trim()
+                val name = item.optString("name").trim()
+                val url = item.optString("url").trim()
+                val iconUrl = item.optString("iconUrl").trim()
+                if (id.isNotBlank() && name.isNotBlank() && isValidExternalUrl(url)) {
+                    add(
+                        ComicWebsite(
+                            id = id,
+                            name = name,
+                            url = url,
+                            iconUrl = iconUrl
+                        )
+                    )
+                }
+            }
+        }
+    } catch (_: Exception) {
+        emptyList()
+    }
+}
+
+internal fun upsertComicWebsite(sharedPrefs: SharedPreferences, website: ComicWebsite) {
+    val currentWebsites = loadComicWebsites(sharedPrefs).toMutableList()
+    val existingIndex = currentWebsites.indexOfFirst { it.id == website.id }
+    if (existingIndex >= 0) {
+        currentWebsites[existingIndex] = website
+    } else {
+        currentWebsites += website
+    }
+    saveComicWebsites(sharedPrefs, currentWebsites)
+}
+
+internal fun removeComicWebsite(sharedPrefs: SharedPreferences, websiteId: String) {
+    saveComicWebsites(
+        sharedPrefs,
+        loadComicWebsites(sharedPrefs).filterNot { it.id == websiteId }
+    )
+}
+
+private fun saveComicWebsites(sharedPrefs: SharedPreferences, websites: List<ComicWebsite>) {
+    val jsonArray = JSONArray()
+    websites.forEach { website ->
+        jsonArray.put(
+            JSONObject().apply {
+                put("id", website.id)
+                put("name", website.name)
+                put("url", website.url)
+                put("iconUrl", website.iconUrl)
+            }
+        )
+    }
+    sharedPrefs.edit { putString(COMIC_WEBSITES_PREF_KEY, jsonArray.toString()) }
 }
 internal fun readBookMetadata(sharedPrefs: SharedPreferences, book: ComicBook): BookMetadata {
     val savedTags = sharedPrefs.getString("${book.id}_tags", null)
@@ -462,6 +550,29 @@ private fun sanitizeDocumentName(rawName: String): String {
 
 internal fun isValidExternalUrl(url: String): Boolean {
     return url.startsWith("http://") || url.startsWith("https://")
+}
+
+internal fun defaultWebsiteIconUrl(url: String): String {
+    return websiteIconUrlCandidates("", url).first()
+}
+
+internal fun websiteIconUrlCandidates(customIconUrl: String, websiteUrl: String): List<String> {
+    val uri = Uri.parse(websiteUrl)
+    val scheme = uri.scheme?.takeIf { it.isNotBlank() } ?: "https"
+    val host = uri.host.orEmpty()
+    if (host.isBlank()) {
+        return listOfNotNull(customIconUrl.takeIf { it.isNotBlank() }, websiteUrl).distinct()
+    }
+    val domain = Uri.encode(host.removePrefix("www."))
+    return listOf(
+        customIconUrl,
+        "https://www.google.com/s2/favicons?sz=128&domain=$domain",
+        "https://icons.duckduckgo.com/ip3/$domain.ico",
+        "https://favicon.yandex.net/favicon/$domain",
+        "$scheme://$host/apple-touch-icon.png",
+        "$scheme://$host/favicon.png",
+        "$scheme://$host/favicon.ico"
+    ).filter { it.isNotBlank() }.distinct()
 }
 
 internal fun isExternalBookId(bookId: String): Boolean {
