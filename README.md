@@ -48,6 +48,7 @@ ComicReader/
 │   └── android-apk.yml            # GitHub Actions APK 构建流程
 ├── build.gradle.kts
 ├── settings.gradle.kts
+├── LICENSE
 └── README.md
 ```
 
@@ -177,4 +178,4 @@ ComicReader-debug-apk
 
 ## License
 
-当前仓库暂未声明开源许可证。如果需要公开分发或允许他人复用代码，建议补充 `LICENSE` 文件。
+本项目基于 MIT License 开源，详情请查看 [LICENSE](LICENSE) 文件。
