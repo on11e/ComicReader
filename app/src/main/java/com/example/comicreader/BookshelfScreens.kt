@@ -6,6 +6,7 @@ import android.net.Uri
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -62,6 +63,7 @@ import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
@@ -340,6 +342,11 @@ private fun BookCard(
     var showEditDialog by remember { mutableStateOf(false) }
     var showDeleteConfirm by remember { mutableStateOf(false) }
     var isDeleting by remember { mutableStateOf(false) }
+    var isPressed by remember { mutableStateOf(false) }
+    val pressScale by animateFloatAsState(
+        targetValue = if (isPressed) 0.97f else 1f,
+        label = "bookCardPressScale"
+    )
     val cacheZipFile = remember(book.id) { File(context.cacheDir, "cover_${book.id.hashCode()}.zip") }
     val scope = rememberCoroutineScope()
 
@@ -354,10 +361,22 @@ private fun BookCard(
     Card(
         modifier = Modifier
             .fillMaxWidth()
+            .graphicsLayer {
+                scaleX = pressScale
+                scaleY = pressScale
+            }
             .shadow(10.dp, shape = RoundedCornerShape(18.dp))
             .clip(RoundedCornerShape(18.dp))
             .pointerInput(book.id) {
                 detectTapGestures(
+                    onPress = {
+                        isPressed = true
+                        try {
+                            tryAwaitRelease()
+                        } finally {
+                            isPressed = false
+                        }
+                    },
                     onTap = { onClick() },
                     onLongPress = { showActionDialog = true }
                 )
@@ -1037,27 +1056,32 @@ internal fun BookDetailScreen(
                         fontWeight = FontWeight.Bold
                     )
                 }
-                if (book.chapters.size == 1) {
-                    item {
-                        Card(
-                            colors = CardDefaults.cardColors(containerColor = Color(0xFF1B1B25)),
-                            border = BorderStroke(1.dp, Color(0xFF303041))
-                        ) {
-                            Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                                Text("如何测试多章节", color = Color.White, fontWeight = FontWeight.Bold)
-                                Text(
-                                    text = "在漫画根目录下先建立一个作品文件夹，然后创建“第1话”“第2话”“第3话”这类子文件夹，并把图片放进去。放在作品文件夹内的 ZIP/CBZ 也会被识别为章节。",
-                                    color = Color(0xFFC6C6D4),
-                                    fontSize = 13.sp,
-                                    lineHeight = 18.sp
-                                )
-                            }
-                        }
-                    }
-                }
                 itemsIndexed(book.chapters, key = { _, chapter -> chapter.id }) { index, chapter ->
+                    var isChapterPressed by remember(chapter.id) { mutableStateOf(false) }
+                    val chapterPressScale by animateFloatAsState(
+                        targetValue = if (isChapterPressed) 0.97f else 1f,
+                        label = "chapterRowPressScale"
+                    )
                     Card(
-                        modifier = Modifier.fillMaxWidth(),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .graphicsLayer {
+                                scaleX = chapterPressScale
+                                scaleY = chapterPressScale
+                            }
+                            .pointerInput(chapter.id) {
+                                detectTapGestures(
+                                    onPress = {
+                                        isChapterPressed = true
+                                        try {
+                                            tryAwaitRelease()
+                                        } finally {
+                                            isChapterPressed = false
+                                        }
+                                    },
+                                    onTap = { onReadChapter(index) }
+                                )
+                            },
                         colors = CardDefaults.cardColors(
                             containerColor = if (index == lastChapterIndex) Color(0xFF222238) else Color(0xFF1A1A24)
                         ),
@@ -1079,7 +1103,13 @@ internal fun BookDetailScreen(
                                 Text(chapter.name, color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold)
                                 Text(if (chapter.isZip) "ZIP/CBZ 章节" else "文件夹章节", color = Color(0xFF9A9AA8), fontSize = 12.sp)
                             }
-                            Button(onClick = { onReadChapter(index) }) {
+                            Box(
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(20.dp))
+                                    .background(Color(0xFF6750A4))
+                                    .padding(horizontal = 16.dp, vertical = 10.dp),
+                                contentAlignment = Alignment.Center
+                            ) {
                                 Text(if (index == lastChapterIndex) "继续" else "阅读")
                             }
                         }
