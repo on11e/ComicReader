@@ -15,6 +15,7 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -58,6 +59,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
@@ -84,6 +86,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.io.File
 import kotlin.math.hypot
+import kotlin.math.roundToInt
 
 @Composable
 internal fun ComicReaderScreen(
@@ -91,6 +94,7 @@ internal fun ComicReaderScreen(
     initialChapterIndex: Int,
     onBack: () -> Unit
 ) {
+    val sliderSeekDebounceMillis = 80L
     val context = LocalContext.current
     val sharedPrefs = remember { context.getSharedPreferences("comic_progress_prefs", Context.MODE_PRIVATE) }
     val scope = rememberCoroutineScope()
@@ -184,6 +188,8 @@ internal fun ComicReaderScreen(
         var readerOffsetY by remember(currentChapter.id, isVerticalMode) { mutableFloatStateOf(0f) }
         var readerViewportSize by remember(currentChapter.id, isVerticalMode) { mutableStateOf(IntSize.Zero) }
         var zoomAnimationJob by remember(currentChapter.id, isVerticalMode) { mutableStateOf<Job?>(null) }
+        var topControlsHeightPx by remember(currentChapter.id, isVerticalMode) { mutableIntStateOf(0) }
+        var bottomControlsHeightPx by remember(currentChapter.id, isVerticalMode) { mutableIntStateOf(0) }
         fun resetReaderZoom() {
             zoomAnimationJob?.cancel()
             readerScale = 1f
@@ -239,14 +245,63 @@ internal fun ComicReaderScreen(
         }
         val pagerState = rememberPagerState(initialPage = savedPage, pageCount = { totalPages })
         val listState = rememberLazyListState(initialFirstVisibleItemIndex = savedPage)
+        var sliderSeekJob by remember(currentChapter.id, isVerticalMode) { mutableStateOf<Job?>(null) }
+        var lastSliderTargetPage by remember(currentChapter.id, isVerticalMode) { mutableIntStateOf(savedPage) }
+        var isSliderDragging by remember(currentChapter.id, isVerticalMode) { mutableStateOf(false) }
         val currentPageIndex = if (isVerticalMode) {
             listState.firstVisibleItemIndex.coerceIn(0, totalPages - 1)
         } else {
             pagerState.currentPage.coerceIn(0, totalPages - 1)
         }
+        val displayedPageIndex = if (isSliderDragging) {
+            sliderValue.roundToInt().coerceIn(0, totalPages - 1)
+        } else {
+            currentPageIndex
+        }
+        suspend fun scrollVerticalPageIntoControlSafePosition(targetPage: Int) {
+            listState.scrollToItem(targetPage)
+            withFrameNanos { }
+            val itemInfo = listState.layoutInfo.visibleItemsInfo.firstOrNull { it.index == targetPage } ?: return
+            val viewportHeight = listState.layoutInfo.viewportEndOffset - listState.layoutInfo.viewportStartOffset
+            val safeTop = if (showControls) topControlsHeightPx else 0
+            val safeBottom = if (showControls) bottomControlsHeightPx else 0
+            val safeHeight = (viewportHeight - safeTop - safeBottom).coerceAtLeast(0)
+            val desiredTop = safeTop + ((safeHeight - itemInfo.size) / 2).coerceAtLeast(0)
+            val scrollDelta = itemInfo.offset - desiredTop
+            if (scrollDelta != 0) {
+                listState.scrollBy(scrollDelta.toFloat())
+            }
+        }
+        suspend fun scrollHorizontalPageWithPrefetch(targetPage: Int) {
+            if (currentChapter.isZip) {
+                (chapterPages.getOrNull(targetPage) as? String)?.let { pageName ->
+                    ComicParser.getZipPageBitmap(cacheZipFile, pageName)
+                }
+            }
+            pagerState.scrollToPage(targetPage)
+        }
+        fun seekToSliderPage(value: Float, force: Boolean = false) {
+            val targetPage = value.roundToInt().coerceIn(0, totalPages - 1)
+            if (!force && targetPage == lastSliderTargetPage) return
+            lastSliderTargetPage = targetPage
+            sliderSeekJob?.cancel()
+            sliderSeekJob = scope.launch {
+                if (!force) {
+                    delay(sliderSeekDebounceMillis)
+                }
+                if (isVerticalMode) {
+                    scrollVerticalPageIntoControlSafePosition(targetPage)
+                } else {
+                    scrollHorizontalPageWithPrefetch(targetPage)
+                }
+            }
+        }
 
         LaunchedEffect(currentPageIndex, currentChapter.id) {
-            sliderValue = currentPageIndex.toFloat()
+            if (!isSliderDragging) {
+                sliderValue = currentPageIndex.toFloat()
+            }
+            lastSliderTargetPage = currentPageIndex
             sharedPrefs.edit {
                 putInt(currentChapter.id, currentPageIndex)
                 putString("${book.id}_last_chapter_id", currentChapter.id)
@@ -256,6 +311,18 @@ internal fun ComicReaderScreen(
             }
             if (autoNextChapter && currentPageIndex == totalPages - 1 && currentChapterIndex < book.chapters.lastIndex) {
                 currentChapterIndex += 1
+            }
+        }
+
+        LaunchedEffect(currentPageIndex, currentChapter.id, currentChapter.isZip) {
+            if (currentChapter.isZip) {
+                listOf(currentPageIndex - 1, currentPageIndex + 1)
+                    .filter { it in 0 until totalPages }
+                    .forEach { pageIndex ->
+                        (chapterPages.getOrNull(pageIndex) as? String)?.let { pageName ->
+                            ComicParser.getZipPageBitmap(cacheZipFile, pageName)
+                        }
+                    }
             }
         }
 
@@ -329,6 +396,7 @@ internal fun ComicReaderScreen(
             } else {
                 HorizontalPager(
                     state = pagerState,
+                    beyondViewportPageCount = 1,
                     modifier = Modifier
                         .fillMaxSize()
                         .graphicsLayer {
@@ -352,7 +420,9 @@ internal fun ComicReaderScreen(
                 visible = showControls,
                 enter = fadeIn(),
                 exit = fadeOut(),
-                modifier = Modifier.align(Alignment.TopCenter)
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .onSizeChanged { topControlsHeightPx = it.height }
             ) {
                 ReaderTopBar(
                     book = book,
@@ -378,19 +448,22 @@ internal fun ComicReaderScreen(
                         .fillMaxWidth()
                         .background(Color(0xE60A0A0F))
                         .navigationBarsPadding()
-                        .padding(horizontal = 20.dp, vertical = 8.dp),
+                        .padding(horizontal = 20.dp, vertical = 8.dp)
+                        .onSizeChanged { bottomControlsHeightPx = it.height },
                     horizontalAlignment = Alignment.CenterHorizontally
                 ) {
-                    Text(text = "第 ${currentPageIndex + 1} / $totalPages 页", color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                    Text(text = "第 ${displayedPageIndex + 1} / $totalPages 页", color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.Bold)
                     Spacer(modifier = Modifier.height(6.dp))
                     Slider(
                         value = sliderValue,
-                        onValueChange = { sliderValue = it },
+                        onValueChange = {
+                            isSliderDragging = true
+                            sliderValue = it
+                            seekToSliderPage(it)
+                        },
                         onValueChangeFinished = {
-                            val targetPage = sliderValue.toInt().coerceIn(0, totalPages - 1)
-                            scope.launch {
-                                if (isVerticalMode) listState.scrollToItem(targetPage) else pagerState.scrollToPage(targetPage)
-                            }
+                            isSliderDragging = false
+                            seekToSliderPage(sliderValue, force = true)
                         },
                         valueRange = 0f..((totalPages - 1).toFloat().coerceAtLeast(1f)),
                         colors = SliderDefaults.colors(
