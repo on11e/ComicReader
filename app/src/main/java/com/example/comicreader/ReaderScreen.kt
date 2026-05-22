@@ -22,6 +22,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -37,6 +38,7 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
@@ -88,6 +90,8 @@ import java.io.File
 import kotlin.math.hypot
 import kotlin.math.roundToInt
 
+private const val DEFAULT_PAGE_GAP_DP = 10f
+
 @Composable
 internal fun ComicReaderScreen(
     book: ComicBook,
@@ -100,8 +104,16 @@ internal fun ComicReaderScreen(
     val scope = rememberCoroutineScope()
     val activity = context as? ComponentActivity
 
-    var isVerticalMode by remember { mutableStateOf(true) }
+    var isVerticalMode by remember {
+        mutableStateOf(sharedPrefs.getBoolean(READER_DEFAULT_VERTICAL_MODE_KEY, true))
+    }
     var hasPageGap by remember { mutableStateOf(true) }
+    var pageGapDp by remember {
+        mutableFloatStateOf(
+            sharedPrefs.getFloat(READER_DEFAULT_PAGE_GAP_DP_KEY, DEFAULT_PAGE_GAP_DP).coerceIn(0f, 48f)
+        )
+    }
+    var showPageGapDialog by remember { mutableStateOf(false) }
     var currentChapterIndex by remember(book.id, initialChapterIndex) {
         mutableIntStateOf(initialChapterIndex.coerceIn(0, book.chapters.lastIndex))
     }
@@ -296,6 +308,16 @@ internal fun ComicReaderScreen(
                 }
             }
         }
+        fun navigateHorizontalPage(pageDelta: Int) {
+            if (isVerticalMode || readerScale > 1f) return
+            val targetPage = (currentPageIndex + pageDelta).coerceIn(0, totalPages - 1)
+            if (targetPage == currentPageIndex) return
+            sliderSeekJob?.cancel()
+            lastSliderTargetPage = targetPage
+            sliderSeekJob = scope.launch {
+                scrollHorizontalPageWithPrefetch(targetPage)
+            }
+        }
 
         LaunchedEffect(currentPageIndex, currentChapter.id) {
             if (!isSliderDragging) {
@@ -382,7 +404,7 @@ internal fun ComicReaderScreen(
                             translationX = readerOffsetX
                             translationY = readerOffsetY
                         },
-                    verticalArrangement = Arrangement.spacedBy(if (hasPageGap) 10.dp else 0.dp)
+                    verticalArrangement = Arrangement.spacedBy(if (hasPageGap) pageGapDp.dp else 0.dp)
                 ) {
                     itemsIndexed(chapterPages, key = { index, _ -> "${currentChapter.id}#$index" }) { _, page ->
                         ReaderImage(
@@ -416,6 +438,30 @@ internal fun ComicReaderScreen(
                 }
             }
 
+            if (!isVerticalMode && readerScale <= 1f) {
+                Row(
+                    modifier = Modifier.fillMaxSize(),
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxHeight()
+                            .width(56.dp)
+                            .pointerInput(currentPageIndex, totalPages) {
+                                detectTapGestures(onTap = { navigateHorizontalPage(-1) })
+                            }
+                    )
+                    Box(
+                        modifier = Modifier
+                            .fillMaxHeight()
+                            .width(56.dp)
+                            .pointerInput(currentPageIndex, totalPages) {
+                                detectTapGestures(onTap = { navigateHorizontalPage(1) })
+                            }
+                    )
+                }
+            }
+
             AnimatedVisibility(
                 visible = showControls,
                 enter = fadeIn(),
@@ -431,9 +477,62 @@ internal fun ComicReaderScreen(
                     chapterCount = book.chapters.size,
                     isVerticalMode = isVerticalMode,
                     hasPageGap = hasPageGap,
+                    pageGapDp = pageGapDp,
                     onBack = onBack,
                     onToggleMode = { isVerticalMode = !isVerticalMode },
-                    onToggleGap = { hasPageGap = !hasPageGap }
+                    onToggleGap = { hasPageGap = !hasPageGap },
+                    onRequestPageGapSettings = {
+                        if (hasPageGap) showPageGapDialog = true
+                    }
+                )
+            }
+
+            if (showPageGapDialog) {
+                AlertDialog(
+                    onDismissRequest = { showPageGapDialog = false },
+                    containerColor = Color(0xFF1E1E28),
+                    title = {
+                        Text("调节页边距", color = Color.White, fontWeight = FontWeight.Bold)
+                    },
+                    text = {
+                        Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                            Text("${pageGapDp.roundToInt()} dp", color = Color(0xFFC9C9D8), fontSize = 13.sp)
+                            Slider(
+                                value = pageGapDp,
+                                onValueChange = { value ->
+                                    pageGapDp = value.roundToInt().toFloat().coerceIn(0f, 48f)
+                                    sharedPrefs.edit {
+                                        putFloat(READER_DEFAULT_PAGE_GAP_DP_KEY, pageGapDp)
+                                    }
+                                },
+                                valueRange = 0f..48f,
+                                steps = 47,
+                                colors = SliderDefaults.colors(
+                                    thumbColor = Color.White,
+                                    activeTrackColor = Color(0xFFE7B95A),
+                                    inactiveTrackColor = Color(0xFF333344)
+                                )
+                            )
+                            Text("当前页距会作为新的默认值。", color = Color(0xFF8F8FA3), fontSize = 12.sp)
+                        }
+                    },
+                    confirmButton = {
+                        TextButton(onClick = { showPageGapDialog = false }) {
+                            Text("完成", color = Color(0xFFE7B95A), fontWeight = FontWeight.Bold)
+                        }
+                    },
+                    dismissButton = {
+                        TextButton(
+                            onClick = {
+                                pageGapDp = DEFAULT_PAGE_GAP_DP
+                                sharedPrefs.edit {
+                                    putFloat(READER_DEFAULT_PAGE_GAP_DP_KEY, DEFAULT_PAGE_GAP_DP)
+                                }
+                            }
+                        ) {
+                            Text("恢复初始值", color = Color.White)
+                        }
+                    }
                 )
             }
 
@@ -548,9 +647,11 @@ private fun ReaderTopBar(
     chapterCount: Int,
     isVerticalMode: Boolean,
     hasPageGap: Boolean,
+    pageGapDp: Float,
     onBack: () -> Unit,
     onToggleMode: () -> Unit,
-    onToggleGap: () -> Unit
+    onToggleGap: () -> Unit,
+    onRequestPageGapSettings: () -> Unit
 ) {
     Column(
         modifier = Modifier
@@ -579,12 +680,24 @@ private fun ReaderTopBar(
                     width = 56.dp
                 )
                 if (isVerticalMode) {
-                    ToolbarIconButton(
-                        label = if (hasPageGap) "页距开" else "页距关",
-                        onClick = onToggleGap,
-                        active = hasPageGap,
-                        width = 62.dp
-                    )
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        ToolbarIconButton(
+                            label = if (hasPageGap) "页距开" else "页距关",
+                            onClick = onToggleGap,
+                            onLongClick = onRequestPageGapSettings,
+                            active = hasPageGap,
+                            width = 62.dp
+                        )
+                        if (hasPageGap) {
+                            Text(
+                                text = "${pageGapDp.roundToInt()} dp",
+                                color = Color(0xFFC9C9D8),
+                                fontSize = 10.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                modifier = Modifier.padding(top = 2.dp)
+                            )
+                        }
+                    }
                 }
             }
         }
@@ -611,6 +724,7 @@ private fun ReaderTopBar(
 private fun ToolbarIconButton(
     label: String,
     onClick: () -> Unit,
+    onLongClick: (() -> Unit)? = null,
     active: Boolean = false,
     enabled: Boolean = true,
     width: Dp = 34.dp
@@ -622,17 +736,22 @@ private fun ToolbarIconButton(
     }
     val textColor = if (active) Color(0xFF12121A) else Color.White
 
-    Button(
-        onClick = onClick,
-        enabled = enabled,
-        shape = RoundedCornerShape(999.dp),
-        colors = ButtonDefaults.buttonColors(
-            containerColor = containerColor,
-            disabledContainerColor = Color(0xFF1A1A22),
-            disabledContentColor = Color(0xFF626274)
-        ),
-        contentPadding = PaddingValues(horizontal = 0.dp, vertical = 0.dp),
-        modifier = Modifier.width(width).height(34.dp)
+    Box(
+        modifier = Modifier
+            .width(width)
+            .height(34.dp)
+            .background(containerColor, RoundedCornerShape(999.dp))
+            .pointerInput(enabled, onClick, onLongClick) {
+                detectTapGestures(
+                    onTap = {
+                        if (enabled) onClick()
+                    },
+                    onLongPress = {
+                        if (enabled) onLongClick?.invoke()
+                    }
+                )
+            },
+        contentAlignment = Alignment.Center
     ) {
         Text(label, color = textColor, fontSize = 11.sp, fontWeight = FontWeight.Bold)
     }

@@ -121,6 +121,10 @@ internal fun BookshelfScreen(
     val context = LocalContext.current
     val sharedPrefs = remember { context.getSharedPreferences("comic_progress_prefs", Context.MODE_PRIVATE) }
     var showMenu by remember { mutableStateOf(false) }
+    var showReaderSettingsMenu by remember { mutableStateOf(false) }
+    var readerDefaultVerticalMode by remember {
+        mutableStateOf(sharedPrefs.getBoolean(READER_DEFAULT_VERTICAL_MODE_KEY, true))
+    }
 
     Scaffold(
         topBar = {
@@ -186,6 +190,45 @@ internal fun BookshelfScreen(
                                 onClick = {
                                     showMenu = false
                                     onAddFavoriteWebsite()
+                                }
+                            )
+                            DropdownMenuItem(
+                                text = { Text("漫画阅读设置", color = Color.White) },
+                                onClick = {
+                                    showMenu = false
+                                    showReaderSettingsMenu = true
+                                }
+                            )
+                        }
+                        DropdownMenu(
+                            expanded = showReaderSettingsMenu,
+                            onDismissRequest = { showReaderSettingsMenu = false },
+                            containerColor = Color(0xFF1C1C28)
+                        ) {
+                            DropdownMenuItem(
+                                text = {
+                                    Text(
+                                        if (readerDefaultVerticalMode) "✓ 默认纵向浏览" else "默认纵向浏览",
+                                        color = Color.White
+                                    )
+                                },
+                                onClick = {
+                                    readerDefaultVerticalMode = true
+                                    sharedPrefs.edit { putBoolean(READER_DEFAULT_VERTICAL_MODE_KEY, true) }
+                                    showReaderSettingsMenu = false
+                                }
+                            )
+                            DropdownMenuItem(
+                                text = {
+                                    Text(
+                                        if (!readerDefaultVerticalMode) "✓ 默认横向浏览" else "默认横向浏览",
+                                        color = Color.White
+                                    )
+                                },
+                                onClick = {
+                                    readerDefaultVerticalMode = false
+                                    sharedPrefs.edit { putBoolean(READER_DEFAULT_VERTICAL_MODE_KEY, false) }
+                                    showReaderSettingsMenu = false
                                 }
                             )
                         }

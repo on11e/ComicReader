@@ -67,6 +67,8 @@ internal const val EXTERNAL_BOOK_ID_PREFIX = "external_book::"
 private const val EXTERNAL_BOOKS_PREF_KEY = "external_books"
 private const val COMIC_WEBSITES_PREF_KEY = "comic_websites"
 private const val LOCAL_BOOKS_SNAPSHOT_PREF_KEY = "local_books_snapshot"
+internal const val READER_DEFAULT_VERTICAL_MODE_KEY = "reader_default_vertical_mode"
+internal const val READER_DEFAULT_PAGE_GAP_DP_KEY = "reader_default_page_gap_dp"
 
 @Composable
 internal fun MainAppScreen() {
