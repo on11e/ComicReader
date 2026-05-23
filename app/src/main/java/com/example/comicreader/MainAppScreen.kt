@@ -236,6 +236,7 @@ internal fun MainAppScreen() {
         selectedBook != null -> BookDetailScreen(
             book = selectedBook!!,
             metadata = metadataMap[selectedBook!!.id] ?: readBookMetadata(sharedPrefs, selectedBook!!),
+            allTags = allTags,
             onBack = { selectedBook = null },
             onEditFinished = {
                 selectedBook?.let { book ->
@@ -316,6 +317,7 @@ internal fun MainAppScreen() {
 
     if (showAddExternalDialog) {
         ExternalBookEditorDialog(
+            allTags = allTags,
             onDismiss = { showAddExternalDialog = false },
             onSaved = {
                 showAddExternalDialog = false

@@ -70,6 +70,7 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
@@ -86,31 +87,6 @@ import kotlinx.coroutines.launch
 import java.io.File
 import java.util.UUID
 import kotlin.math.roundToInt
-@Composable
-private fun LibrarySetupScreen(onPickFolder: () -> Unit) {
-    Box(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(Brush.verticalGradient(listOf(Color(0xFF1F1F2E), Color(0xFF0F0F15)))),
-        contentAlignment = Alignment.Center
-    ) {
-        Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(24.dp)) {
-            Text("KAMI COMIC", color = Color.White, fontSize = 32.sp, fontWeight = FontWeight.Black, letterSpacing = 2.sp)
-            Text("本地离线漫画阅读器", color = Color(0xFFB3B3C2), fontSize = 14.sp, modifier = Modifier.padding(top = 8.dp))
-            Spacer(modifier = Modifier.height(48.dp))
-            Button(
-                onClick = onPickFolder,
-                shape = RoundedCornerShape(12.dp),
-                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF6200EE)),
-                modifier = Modifier
-                    .height(54.dp)
-                    .width(240.dp)
-            ) {
-                Text("选择漫画目录", fontSize = 16.sp, fontWeight = FontWeight.Bold, color = Color.White)
-            }
-        }
-    }
-}
 
 @Composable
 internal fun BookshelfScreen(
@@ -326,6 +302,7 @@ internal fun BookshelfScreen(
                         BookCard(
                             book = book,
                             metadata = metadataMap[book.id] ?: readBookMetadata(sharedPrefs, book),
+                            allTags = allTags,
                             onClick = { onBookClick(book) },
                             onMetaChanged = { onRefreshMetadata(book) },
                             onDelete = onDeleteBook
@@ -341,6 +318,7 @@ internal fun BookshelfScreen(
 private fun BookCard(
     book: ComicBook,
     metadata: BookMetadata,
+    allTags: List<String>,
     onClick: () -> Unit,
     onMetaChanged: () -> Unit,
     onDelete: suspend (ComicBook) -> Boolean
@@ -543,6 +521,7 @@ private fun BookCard(
             ExternalBookEditorDialog(
                 existingBook = book,
                 initialMetadata = metadata,
+                allTags = allTags,
                 onDismiss = { showEditDialog = false },
                 onSaved = {
                     showEditDialog = false
@@ -553,6 +532,7 @@ private fun BookCard(
             ModernEditBookMetadataDialog(
                 book = book,
                 initialMetadata = metadata,
+                allTags = allTags,
                 onDismiss = { showEditDialog = false },
                 onSaved = {
                     showEditDialog = false
@@ -871,6 +851,7 @@ internal fun AddFavoriteWebsiteDialog(
 internal fun ExternalBookEditorDialog(
     existingBook: ComicBook? = null,
     initialMetadata: BookMetadata? = null,
+    allTags: List<String> = emptyList(),
     onDismiss: () -> Unit,
     onSaved: () -> Unit
 ) {
@@ -898,7 +879,11 @@ internal fun ExternalBookEditorDialog(
                 TextField(value = inputName, onValueChange = { inputName = it }, label = { Text("漫画名称") }, modifier = Modifier.fillMaxWidth())
                 TextField(value = inputExternalUrl, onValueChange = { inputExternalUrl = it }, label = { Text("来源网站地址") }, modifier = Modifier.fillMaxWidth())
                 TextField(value = inputDesc, onValueChange = { inputDesc = it }, label = { Text("简介") }, modifier = Modifier.fillMaxWidth())
-                TextField(value = inputTags, onValueChange = { inputTags = it }, label = { Text("标签，使用逗号分隔") }, modifier = Modifier.fillMaxWidth())
+                TagPickerField(
+                    value = inputTags,
+                    onValueChange = { inputTags = it },
+                    availableTags = allTags
+                )
                 Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF1B1B25)), border = BorderStroke(1.dp, Color(0xFF303041))) {
                     Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                         Text("自定义封面", color = Color.White, fontWeight = FontWeight.Bold)
@@ -959,6 +944,7 @@ internal fun ExternalBookEditorDialog(
 internal fun BookDetailScreen(
     book: ComicBook,
     metadata: BookMetadata,
+    allTags: List<String>,
     onBack: () -> Unit,
     onEditFinished: () -> Unit,
     onRenameChapter: suspend (ComicChapter, String) -> Boolean,
@@ -1176,6 +1162,7 @@ internal fun BookDetailScreen(
             ExternalBookEditorDialog(
                 existingBook = book,
                 initialMetadata = metadata,
+                allTags = allTags,
                 onDismiss = { showEditDialog = false },
                 onSaved = {
                     showEditDialog = false
@@ -1186,6 +1173,7 @@ internal fun BookDetailScreen(
             ModernEditBookMetadataDialog(
                 book = book,
                 initialMetadata = metadata,
+                allTags = allTags,
                 onDismiss = { showEditDialog = false },
                 onSaved = {
                     showEditDialog = false
@@ -1533,123 +1521,10 @@ private fun RenameChapterDialog(
 }
 
 @Composable
-private fun EditBookMetadataDialog(
-    book: ComicBook,
-    initialMetadata: BookMetadata,
-    onDismiss: () -> Unit,
-    onSaved: () -> Unit
-) {
-    val context = LocalContext.current
-    val sharedPrefs = remember { context.getSharedPreferences("comic_progress_prefs", Context.MODE_PRIVATE) }
-
-    var inputName by remember { mutableStateOf(initialMetadata.customName) }
-    var inputDesc by remember { mutableStateOf(initialMetadata.customDesc) }
-    var inputTags by remember { mutableStateOf(initialMetadata.tags.joinToString(", ")) }
-    var inputCoverPage by remember { mutableStateOf(initialMetadata.coverPage.toString()) }
-    var autoNextChapter by remember { mutableStateOf(initialMetadata.autoNextChapter) }
-    var inputExternalUrl by remember { mutableStateOf(initialMetadata.externalUrl) }
-    var inputCoverUri by remember { mutableStateOf(initialMetadata.customCoverUri) }
-    val imagePicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
-        if (uri != null) {
-            saveCoverToAppStorage(context, uri)?.let { storedUri ->
-                inputCoverUri = storedUri
-            } ?: Toast.makeText(context, "封面保存失败，请重新选择图片", Toast.LENGTH_SHORT).show()
-        }
-    }
-
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("编辑漫画资料") },
-        text = {
-            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                TextField(value = inputName, onValueChange = { inputName = it }, label = { Text("漫画名称") }, modifier = Modifier.fillMaxWidth())
-                TextField(value = inputDesc, onValueChange = { inputDesc = it }, label = { Text("简介") }, modifier = Modifier.fillMaxWidth())
-                TextField(value = inputTags, onValueChange = { inputTags = it }, label = { Text("标签，使用逗号分隔") }, modifier = Modifier.fillMaxWidth())
-                TextField(value = inputCoverPage, onValueChange = { inputCoverPage = it }, label = { Text("封面页码") }, modifier = Modifier.fillMaxWidth())
-                Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF1B1B25)), border = BorderStroke(1.dp, Color(0xFF303041))) {
-                    Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Text("自定义封面", color = Color.White, fontWeight = FontWeight.Bold)
-                        Text(
-                            text = if (inputCoverUri.isBlank()) "未选择封面图，将使用封面页码。" else inputCoverUri,
-                            color = Color(0xFFC6C6D4),
-                            fontSize = 12.sp,
-                            lineHeight = 18.sp
-                        )
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            OutlinedButton(onClick = { imagePicker.launch(arrayOf("image/*")) }) { Text("选择图片") }
-                            if (inputCoverUri.isNotBlank()) {
-                                OutlinedButton(onClick = { inputCoverUri = "" }) { Text("清除") }
-                            }
-                        }
-                    }
-                }
-                TextField(
-                    value = inputExternalUrl,
-                    onValueChange = { inputExternalUrl = it },
-                    label = { Text("来源网站地址（可选）") },
-                    modifier = Modifier.fillMaxWidth()
-                )
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Column(
-                        modifier = Modifier
-                            .fillMaxWidth(0.72f)
-                            .padding(end = 12.dp)
-                    ) {
-                        Text("章节结尾自动进入下一章", fontSize = 14.sp)
-                        Text("关闭后会在本章结束时弹出提示", color = Color.Gray, fontSize = 12.sp)
-                    }
-                    Switch(checked = autoNextChapter, onCheckedChange = { autoNextChapter = it })
-                }
-                OutlinedButton(
-                    onClick = {
-                        resetReadingRecords(sharedPrefs, book.id)
-                        Toast.makeText(context, "阅读记录已重置", Toast.LENGTH_SHORT).show()
-                        onSaved()
-                    },
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Text("重置阅读记录")
-                }
-            }
-        },
-        confirmButton = {
-            Button(
-                onClick = {
-                    val externalUrl = inputExternalUrl.trim()
-                    if (externalUrl.isNotBlank() && !isValidExternalUrl(externalUrl)) {
-                        Toast.makeText(context, "外链地址必须以 http:// 或 https:// 开头", Toast.LENGTH_SHORT).show()
-                        return@Button
-                    }
-                    val coverPage = inputCoverPage.toIntOrNull()?.coerceAtLeast(1) ?: 1
-                    sharedPrefs.edit {
-                        putString("${book.id}_custom_name", inputName.trim().ifEmpty { book.name })
-                        putString("${book.id}_custom_desc", inputDesc.trim())
-                        putString("${book.id}_tags", normalizeTags(inputTags).joinToString(","))
-                        putInt("${book.id}_cover_index", coverPage)
-                        putBoolean("${book.id}_auto_next", autoNextChapter)
-                        putBoolean("${book.id}_external_only", false)
-                        putBoolean("${book.id}_open_externally", false)
-                        putString("${book.id}_external_url", externalUrl)
-                        putString("${book.id}_custom_cover_uri", inputCoverUri.trim())
-                    }
-                    onSaved()
-                }
-            ) { Text("保存") }
-        },
-        dismissButton = {
-            TextButton(onClick = onDismiss) { Text("取消") }
-        }
-    )
-}
-
-@Composable
 private fun ModernEditBookMetadataDialog(
     book: ComicBook,
     initialMetadata: BookMetadata,
+    allTags: List<String>,
     onDismiss: () -> Unit,
     onSaved: () -> Unit
 ) {
@@ -1703,10 +1578,10 @@ private fun ModernEditBookMetadataDialog(
                         singleLine = false,
                         maxLines = 2
                     )
-                    CompactMetadataTextField(
+                    TagPickerField(
                         value = inputTags,
                         onValueChange = { inputTags = it },
-                        label = "标签，使用逗号分隔"
+                        availableTags = allTags
                     )
                 }
 
@@ -1868,6 +1743,109 @@ private fun ModernEditBookMetadataDialog(
                     onClick = { showResetConfirm = false },
                     colors = ButtonDefaults.textButtonColors(contentColor = Color(0xFFFFD34D))
                 ) { Text("取消") }
+            }
+        )
+    }
+}
+
+@Composable
+private fun TagPickerField(
+    value: String,
+    onValueChange: (String) -> Unit,
+    availableTags: List<String>
+) {
+    var showTagDialog by remember { mutableStateOf(false) }
+    var newTag by remember { mutableStateOf("") }
+
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        TextField(
+            value = value,
+            onValueChange = onValueChange,
+            label = { Text("标签，使用逗号分隔", fontSize = 12.sp) },
+            singleLine = true,
+            modifier = Modifier
+                .fillMaxWidth()
+                .onFocusChanged { focusState ->
+                    if (focusState.isFocused) {
+                        showTagDialog = true
+                    }
+                }
+                .height(56.dp)
+        )
+        OutlinedButton(
+            onClick = { showTagDialog = true },
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Text("选择或新建标签")
+        }
+    }
+
+    if (showTagDialog) {
+        val selectedTags = normalizeTags(value)
+        val tagOptions = (availableTags + selectedTags)
+            .map { it.trim() }
+            .filter { it.isNotBlank() }
+            .distinct()
+            .sorted()
+
+        AlertDialog(
+            onDismissRequest = { showTagDialog = false },
+            title = { Text("编辑标签") },
+            text = {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(max = 420.dp)
+                        .verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    if (tagOptions.isEmpty()) {
+                        Text("还没有已有标签，可以先创建新标签。", color = Color(0xFFC6C6D4), fontSize = 13.sp)
+                    } else {
+                        tagOptions.forEach { tag ->
+                            FilterChip(
+                                selected = selectedTags.contains(tag),
+                                onClick = {
+                                    val nextTags = selectedTags.toMutableList()
+                                    if (nextTags.contains(tag)) {
+                                        nextTags.remove(tag)
+                                    } else {
+                                        nextTags.add(tag)
+                                    }
+                                    onValueChange(nextTags.joinToString(", "))
+                                },
+                                label = { Text(tag) },
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                        }
+                    }
+
+                    TextField(
+                        value = newTag,
+                        onValueChange = { newTag = it },
+                        label = { Text("新标签") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    Button(
+                        onClick = {
+                            val nextTags = (selectedTags + normalizeTags(newTag))
+                                .filter { it.isNotBlank() }
+                                .distinct()
+                            onValueChange(nextTags.joinToString(", "))
+                            newTag = ""
+                        },
+                        enabled = newTag.isNotBlank(),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("创建并选中")
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { showTagDialog = false }) {
+                    Text("完成")
+                }
             }
         )
     }
