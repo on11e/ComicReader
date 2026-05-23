@@ -17,6 +17,7 @@ import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
@@ -91,6 +92,9 @@ import kotlin.math.hypot
 import kotlin.math.roundToInt
 
 private const val DEFAULT_PAGE_GAP_DP = 10f
+private const val LONG_IMAGE_HEIGHT_THRESHOLD_PX = 8192
+private const val LONG_IMAGE_ASPECT_RATIO_THRESHOLD = 4f
+private const val LONG_IMAGE_SLICE_HEIGHT_PX = 2048
 
 @Composable
 internal fun ComicReaderScreen(
@@ -336,8 +340,8 @@ internal fun ComicReaderScreen(
             }
         }
 
-        LaunchedEffect(currentPageIndex, currentChapter.id, currentChapter.isZip) {
-            if (currentChapter.isZip) {
+        LaunchedEffect(currentPageIndex, currentChapter.id, currentChapter.isZip, isVerticalMode) {
+            if (currentChapter.isZip && !isVerticalMode) {
                 listOf(currentPageIndex - 1, currentPageIndex + 1)
                     .filter { it in 0 until totalPages }
                     .forEach { pageIndex ->
@@ -849,6 +853,16 @@ private fun ReaderImage(
     modifier: Modifier = Modifier,
     isFullScreen: Boolean
 ) {
+    if (!isFullScreen) {
+        VerticalReaderImage(
+            page = page,
+            isFolder = isFolder,
+            cacheZipFile = cacheZipFile,
+            modifier = modifier
+        )
+        return
+    }
+
     val sizedImageModifier = if (isFullScreen) {
         Modifier.fillMaxSize()
     } else {
@@ -885,4 +899,181 @@ private fun ReaderImage(
             } ?: CircularProgressIndicator(color = Color(0xFF333344))
         }
     }
+}
+
+@Composable
+private fun VerticalReaderImage(
+    page: Any,
+    isFolder: Boolean,
+    cacheZipFile: File,
+    modifier: Modifier = Modifier
+) {
+    val context = LocalContext.current
+    var imageSize by remember(page, cacheZipFile) { mutableStateOf<ComicImageSize?>(null) }
+    var isSizeLoaded by remember(page, cacheZipFile) { mutableStateOf(false) }
+
+    LaunchedEffect(page, cacheZipFile) {
+        imageSize = if (isFolder) {
+            ComicParser.getFolderPageSize(context, page as Uri)
+        } else {
+            ComicParser.getZipPageSize(cacheZipFile, page as String)
+        }
+        isSizeLoaded = true
+    }
+
+    val size = imageSize
+    if (!isSizeLoaded) {
+        Box(
+            modifier = modifier
+                .fillMaxWidth()
+                .heightIn(min = 400.dp)
+                .background(Color(0xFF0D0D12)),
+            contentAlignment = Alignment.Center
+        ) {
+            CircularProgressIndicator(color = Color(0xFF333344))
+        }
+        return
+    }
+
+    if (
+        size != null &&
+        size.isLongImage()
+    ) {
+        LongVerticalReaderImage(
+            page = page,
+            isFolder = isFolder,
+            cacheZipFile = cacheZipFile,
+            imageSize = size,
+            modifier = modifier
+        )
+    } else {
+        StandardVerticalReaderImage(
+            page = page,
+            isFolder = isFolder,
+            cacheZipFile = cacheZipFile,
+            modifier = modifier
+        )
+    }
+}
+
+@Composable
+private fun StandardVerticalReaderImage(
+    page: Any,
+    isFolder: Boolean,
+    cacheZipFile: File,
+    modifier: Modifier = Modifier
+) {
+    Box(
+        modifier = modifier
+            .fillMaxWidth()
+            .heightIn(min = 400.dp)
+            .background(Color(0xFF0D0D12)),
+        contentAlignment = Alignment.Center
+    ) {
+        if (isFolder) {
+            AsyncImage(
+                model = page as Uri,
+                contentDescription = null,
+                modifier = Modifier.fillMaxWidth().wrapContentHeight(),
+                contentScale = ContentScale.FillWidth
+            )
+        } else {
+            var bitmap by remember(page) { mutableStateOf<Bitmap?>(null) }
+            LaunchedEffect(page) {
+                bitmap = ComicParser.getZipPageBitmap(cacheZipFile, page as String)
+            }
+            bitmap?.let { loadedBitmap ->
+                Image(
+                    bitmap = loadedBitmap.asImageBitmap(),
+                    contentDescription = null,
+                    modifier = Modifier.fillMaxWidth().wrapContentHeight(),
+                    contentScale = ContentScale.FillWidth
+                )
+            } ?: CircularProgressIndicator(color = Color(0xFF333344))
+        }
+    }
+}
+
+@Composable
+private fun LongVerticalReaderImage(
+    page: Any,
+    isFolder: Boolean,
+    cacheZipFile: File,
+    imageSize: ComicImageSize,
+    modifier: Modifier = Modifier
+) {
+    val sliceCount = ((imageSize.height + LONG_IMAGE_SLICE_HEIGHT_PX - 1) / LONG_IMAGE_SLICE_HEIGHT_PX)
+        .coerceAtLeast(1)
+
+    Column(
+        modifier = modifier
+            .fillMaxWidth()
+            .background(Color(0xFF0D0D12))
+    ) {
+        repeat(sliceCount) { sliceIndex ->
+            val top = sliceIndex * LONG_IMAGE_SLICE_HEIGHT_PX
+            val sliceHeight = (imageSize.height - top).coerceAtMost(LONG_IMAGE_SLICE_HEIGHT_PX)
+            LongImageSlice(
+                page = page,
+                isFolder = isFolder,
+                cacheZipFile = cacheZipFile,
+                top = top,
+                sliceHeight = sliceHeight,
+                sourceWidth = imageSize.width
+            )
+        }
+    }
+}
+
+@Composable
+private fun LongImageSlice(
+    page: Any,
+    isFolder: Boolean,
+    cacheZipFile: File,
+    top: Int,
+    sliceHeight: Int,
+    sourceWidth: Int
+) {
+    val context = LocalContext.current
+    var bitmap by remember(page, cacheZipFile, top, sliceHeight) { mutableStateOf<Bitmap?>(null) }
+
+    LaunchedEffect(page, cacheZipFile, top, sliceHeight) {
+        bitmap = if (isFolder) {
+            ComicParser.getFolderPageRegionBitmap(
+                context = context,
+                pageUri = page as Uri,
+                top = top,
+                height = sliceHeight
+            )
+        } else {
+            ComicParser.getZipPageRegionBitmap(
+                zipFile = cacheZipFile,
+                entryName = page as String,
+                top = top,
+                height = sliceHeight
+            )
+        }
+    }
+
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .aspectRatio(sourceWidth.toFloat() / sliceHeight.toFloat())
+            .background(Color(0xFF0D0D12)),
+        contentAlignment = Alignment.Center
+    ) {
+        bitmap?.let { loadedBitmap ->
+            Image(
+                bitmap = loadedBitmap.asImageBitmap(),
+                contentDescription = null,
+                modifier = Modifier.fillMaxSize(),
+                contentScale = ContentScale.FillBounds
+            )
+        } ?: CircularProgressIndicator(color = Color(0xFF333344))
+    }
+}
+
+private fun ComicImageSize.isLongImage(): Boolean {
+    return height > LONG_IMAGE_HEIGHT_THRESHOLD_PX ||
+        height.toFloat() / width.toFloat() > LONG_IMAGE_ASPECT_RATIO_THRESHOLD
 }

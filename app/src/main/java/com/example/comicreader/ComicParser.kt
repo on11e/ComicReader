@@ -3,6 +3,8 @@ package com.example.comicreader
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.BitmapRegionDecoder
+import android.graphics.Rect
 import android.net.Uri
 import android.util.LruCache
 import androidx.documentfile.provider.DocumentFile
@@ -25,6 +27,11 @@ data class ComicBook(
     val uri: Uri,
     val description: String,
     val chapters: List<ComicChapter>
+)
+
+data class ComicImageSize(
+    val width: Int,
+    val height: Int
 )
 
 object ComicParser {
@@ -288,8 +295,108 @@ object ComicParser {
         }
     }
 
+    suspend fun getFolderPageSize(context: Context, pageUri: Uri): ComicImageSize? = withContext(Dispatchers.IO) {
+        try {
+            val options = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            context.contentResolver.openInputStream(pageUri)?.use { inputStream ->
+                BitmapFactory.decodeStream(inputStream, null, options)
+            }
+            options.toComicImageSize()
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    suspend fun getZipPageSize(zipFile: File, entryName: String): ComicImageSize? = withContext(Dispatchers.IO) {
+        try {
+            val options = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            ZipFile(zipFile).use { zip ->
+                val entry = zip.getEntry(entryName) ?: return@withContext null
+                zip.getInputStream(entry).use { inputStream ->
+                    BitmapFactory.decodeStream(inputStream, null, options)
+                }
+            }
+            options.toComicImageSize()
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    suspend fun getFolderPageRegionBitmap(
+        context: Context,
+        pageUri: Uri,
+        top: Int,
+        height: Int
+    ): Bitmap? = withContext(Dispatchers.IO) {
+        try {
+            context.contentResolver.openInputStream(pageUri)?.use { inputStream ->
+                val decoder = BitmapRegionDecoder.newInstance(inputStream, false) ?: return@withContext null
+                try {
+                    decoder.decodeRegion(
+                        Rect(
+                            0,
+                            top.coerceAtLeast(0),
+                            decoder.width,
+                            (top + height).coerceAtMost(decoder.height)
+                        ),
+                        BitmapFactory.Options().apply {
+                            inPreferredConfig = Bitmap.Config.ARGB_8888
+                        }
+                    )
+                } finally {
+                    decoder.recycle()
+                }
+            }
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    suspend fun getZipPageRegionBitmap(
+        zipFile: File,
+        entryName: String,
+        top: Int,
+        height: Int
+    ): Bitmap? = withContext(Dispatchers.IO) {
+        try {
+            ZipFile(zipFile).use { zip ->
+                val entry = zip.getEntry(entryName) ?: return@withContext null
+                zip.getInputStream(entry).use { inputStream ->
+                    val decoder = BitmapRegionDecoder.newInstance(inputStream, false) ?: return@withContext null
+                    try {
+                        decoder.decodeRegion(
+                            Rect(
+                                0,
+                                top.coerceAtLeast(0),
+                                decoder.width,
+                                (top + height).coerceAtMost(decoder.height)
+                            ),
+                            BitmapFactory.Options().apply {
+                                inPreferredConfig = Bitmap.Config.ARGB_8888
+                            }
+                        )
+                    } finally {
+                        decoder.recycle()
+                    }
+                }
+            }
+        } catch (_: Exception) {
+            null
+        }
+    }
+
     private fun File.cacheKey(): String {
         return "$absolutePath:${lastModified()}:${length()}"
+    }
+
+    private fun BitmapFactory.Options.toComicImageSize(): ComicImageSize? {
+        return if (outWidth > 0 && outHeight > 0) {
+            ComicImageSize(outWidth, outHeight)
+        } else {
+            null
+        }
     }
 
     fun trimZipCache(context: Context, maxBytes: Long = ZIP_CACHE_MAX_BYTES) {
