@@ -11,6 +11,7 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -26,10 +27,12 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.AlertDialog
@@ -66,7 +69,9 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -77,6 +82,7 @@ import coil.compose.AsyncImage
 import kotlinx.coroutines.launch
 import java.io.File
 import java.util.UUID
+import kotlin.math.roundToInt
 @Composable
 private fun LibrarySetupScreen(onPickFolder: () -> Unit) {
     Box(
@@ -966,6 +972,9 @@ internal fun BookDetailScreen(
     val lastChapterIndex = remember(book.id, hasLocalChapters) {
         if (hasLocalChapters) resolveLastChapterIndex(sharedPrefs, book) else 0
     }
+    var selectedChapterIndex by remember(book.id, lastChapterIndex) {
+        mutableIntStateOf(lastChapterIndex.coerceIn(0, (book.chapters.size - 1).coerceAtLeast(0)))
+    }
 
     Scaffold(
         topBar = {
@@ -984,13 +993,32 @@ internal fun BookDetailScreen(
         },
         containerColor = Color(0xFF12121A)
     ) { paddingValues ->
-        LazyColumn(
+        BookDetailFixedContent(
+            book = book,
+            metadata = metadata,
+            paddingValues = paddingValues,
+            hasLocalChapters = hasLocalChapters,
+            hasExternalUrl = hasExternalUrl,
+            lastChapterIndex = lastChapterIndex,
+            selectedChapterIndex = selectedChapterIndex,
+            onSelectedChapterChange = { selectedChapterIndex = it },
+            onReadSelectedChapter = { onReadChapter(selectedChapterIndex) },
+            onOpenExternal = { openExternalComic(context, metadata.externalUrl) },
+            onRenameChapter = { editingChapter = it }
+        )
+
+        /*
+        Box(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(paddingValues),
-            contentPadding = PaddingValues(20.dp),
-            verticalArrangement = Arrangement.spacedBy(16.dp)
+                .padding(paddingValues)
         ) {
+            LazyColumn(
+                modifier = Modifier.fillMaxSize(),
+                state = detailListState,
+                contentPadding = PaddingValues(start = 20.dp, top = 20.dp, end = 32.dp, bottom = 20.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
             item {
                 Card(
                     colors = CardDefaults.cardColors(containerColor = Color(0xFF171720)),
@@ -1096,29 +1124,29 @@ internal fun BookDetailScreen(
                         colors = CardDefaults.cardColors(
                             containerColor = if (index == lastChapterIndex) Color(0xFF222238) else Color(0xFF1A1A24)
                         ),
-                        shape = RoundedCornerShape(18.dp),
+                        shape = RoundedCornerShape(14.dp),
                         border = if (index == lastChapterIndex) BorderStroke(1.dp, Color(0xFF4A4A76)) else null
                     ) {
                         Row(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .padding(horizontal = 16.dp, vertical = 14.dp),
+                                .padding(horizontal = 12.dp, vertical = 8.dp),
                             horizontalArrangement = Arrangement.SpaceBetween,
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             Column(
                                 modifier = Modifier
-                                    .fillMaxWidth(0.7f)
-                                    .padding(end = 12.dp)
+                                    .fillMaxWidth(0.72f)
+                                    .padding(end = 10.dp)
                             ) {
-                                Text(chapter.name, color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                                Text(chapter.name, color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.Bold)
                                 Text(if (chapter.isZip) "ZIP/CBZ 章节" else "文件夹章节", color = Color(0xFF9A9AA8), fontSize = 12.sp)
                             }
                             Box(
                                 modifier = Modifier
-                                    .clip(RoundedCornerShape(20.dp))
+                                    .clip(RoundedCornerShape(18.dp))
                                     .background(Color(0xFF6750A4))
-                                    .padding(horizontal = 16.dp, vertical = 10.dp),
+                                    .padding(horizontal = 12.dp, vertical = 7.dp),
                                 contentAlignment = Alignment.Center
                             ) {
                                 Text(if (index == lastChapterIndex) "继续" else "阅读")
@@ -1127,7 +1155,17 @@ internal fun BookDetailScreen(
                     }
                 }
             }
+            }
+            if (hasLocalChapters) {
+                ChapterFastScrollbar(
+                    listState = detailListState,
+                    modifier = Modifier
+                        .align(Alignment.CenterEnd)
+                        .padding(end = 8.dp, top = 12.dp, bottom = 12.dp)
+                )
+            }
         }
+        */
     }
 
     if (showEditDialog) {
@@ -1173,6 +1211,277 @@ internal fun BookDetailScreen(
                     ).show()
                 }
             }
+        )
+    }
+}
+
+@Composable
+private fun BookDetailFixedContent(
+    book: ComicBook,
+    metadata: BookMetadata,
+    paddingValues: PaddingValues,
+    hasLocalChapters: Boolean,
+    hasExternalUrl: Boolean,
+    lastChapterIndex: Int,
+    selectedChapterIndex: Int,
+    onSelectedChapterChange: (Int) -> Unit,
+    onReadSelectedChapter: () -> Unit,
+    onOpenExternal: () -> Unit,
+    onRenameChapter: (ComicChapter) -> Unit
+) {
+    val context = LocalContext.current
+    val chapterListState = rememberLazyListState()
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(paddingValues)
+            .padding(horizontal = 20.dp, vertical = 16.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp)
+    ) {
+        Card(
+            colors = CardDefaults.cardColors(containerColor = Color(0xFF171720)),
+            shape = RoundedCornerShape(22.dp)
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(Brush.verticalGradient(listOf(Color(0xFF202033), Color(0xFF171720))))
+                    .padding(18.dp)
+            ) {
+                Text(metadata.customName, color = Color.White, fontSize = 28.sp, fontWeight = FontWeight.Black)
+                if (shouldShowDescription(book, metadata)) {
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text(metadata.customDesc, color = Color(0xFFB9B9C6), fontSize = 14.sp, lineHeight = 20.sp)
+                }
+                Spacer(modifier = Modifier.height(14.dp))
+                Row(
+                    modifier = Modifier.horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    MetaPill(text = if (hasLocalChapters) "共 ${book.chapters.size} 章" else "外链漫画")
+                    if (hasExternalUrl) {
+                        MetaPill(text = "在线阅读", accent = true)
+                    }
+                    metadata.tags.filter { it.isNotBlank() }.forEach { tag ->
+                        MetaPill(text = tag, accent = true)
+                    }
+                }
+            }
+        }
+        if (hasExternalUrl) {
+            Button(
+                onClick = onOpenExternal,
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF8E6BD8)),
+                shape = RoundedCornerShape(14.dp),
+                contentPadding = PaddingValues(horizontal = 18.dp, vertical = 12.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text("在线阅读", color = Color.White, fontWeight = FontWeight.Bold)
+            }
+            Card(
+                colors = CardDefaults.cardColors(containerColor = Color(0xFF1B1B25)),
+                border = BorderStroke(1.dp, Color(0xFF303041))
+            ) {
+                Text(
+                    text = "来源网站：${metadata.externalUrl}",
+                    modifier = Modifier.padding(16.dp),
+                    color = Color(0xFFBB86FC),
+                    fontSize = 13.sp,
+                    lineHeight = 18.sp
+                )
+            }
+        }
+        if (hasLocalChapters) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth(0.82f)
+                    .weight(1f)
+                    .align(Alignment.CenterHorizontally),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = "本地章节",
+                    color = Color.White,
+                    fontSize = 18.sp,
+                    fontWeight = FontWeight.Bold
+                )
+                Button(
+                    onClick = onReadSelectedChapter,
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF6750A4)),
+                    shape = RoundedCornerShape(12.dp),
+                    contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp)
+                ) {
+                    Text("阅读", color = Color.White, fontWeight = FontWeight.Bold)
+                }
+            }
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f)
+            ) {
+                LazyColumn(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(end = 16.dp),
+                    state = chapterListState,
+                    contentPadding = PaddingValues(bottom = 8.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    itemsIndexed(book.chapters, key = { _, chapter -> chapter.id }) { index, chapter ->
+                        var isChapterPressed by remember(chapter.id) { mutableStateOf(false) }
+                        val canRenameChapter = !(chapter.id.endsWith("#root") && chapter.sourceUri == book.uri)
+                        val isSelectedChapter = index == selectedChapterIndex
+                        val chapterPressScale by animateFloatAsState(
+                            targetValue = if (isChapterPressed) 0.98f else 1f,
+                            label = "chapterRowPressScale"
+                        )
+                        Card(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .graphicsLayer {
+                                    scaleX = chapterPressScale
+                                    scaleY = chapterPressScale
+                                }
+                                .pointerInput(chapter.id) {
+                                    detectTapGestures(
+                                        onPress = {
+                                            isChapterPressed = true
+                                            try {
+                                                tryAwaitRelease()
+                                            } finally {
+                                                isChapterPressed = false
+                                            }
+                                        },
+                                        onLongPress = {
+                                            if (canRenameChapter) {
+                                                onRenameChapter(chapter)
+                                            } else {
+                                                Toast.makeText(context, "该章节使用漫画根目录，不能在这里重命名", Toast.LENGTH_SHORT).show()
+                                            }
+                                        },
+                                        onTap = { onSelectedChapterChange(index) }
+                                    )
+                                },
+                            colors = CardDefaults.cardColors(
+                                containerColor = when {
+                                    isSelectedChapter -> Color(0xFF2A2A44)
+                                    index == lastChapterIndex -> Color(0xFF222238)
+                                    else -> Color(0xFF1A1A24)
+                                }
+                            ),
+                            shape = RoundedCornerShape(10.dp),
+                            border = if (isSelectedChapter) {
+                                BorderStroke(1.dp, Color(0xFF8E6BD8))
+                            } else if (index == lastChapterIndex) {
+                                BorderStroke(1.dp, Color(0xFF4A4A76))
+                            } else {
+                                null
+                            }
+                        ) {
+                            Text(
+                                text = chapter.name,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 12.dp, vertical = 7.dp),
+                                color = Color.White,
+                                fontSize = 14.sp,
+                                fontWeight = if (isSelectedChapter) FontWeight.Bold else FontWeight.Medium,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
+                    }
+                }
+                ChapterFastScrollbar(
+                    listState = chapterListState,
+                    modifier = Modifier
+                        .align(Alignment.CenterEnd)
+                        .padding(end = 2.dp)
+                )
+            }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ChapterFastScrollbar(
+    listState: LazyListState,
+    modifier: Modifier = Modifier
+) {
+    val scope = rememberCoroutineScope()
+    val density = LocalDensity.current
+    var trackHeightPx by remember { mutableIntStateOf(0) }
+    var draggingThumbOffsetPx by remember { mutableStateOf<Float?>(null) }
+    val layoutInfo = listState.layoutInfo
+    val totalItems = layoutInfo.totalItemsCount
+    val visibleItems = layoutInfo.visibleItemsInfo.size.coerceAtLeast(1)
+
+    if (totalItems <= visibleItems) return
+
+    val minThumbHeightPx = with(density) { 44.dp.roundToPx() }
+    val thumbHeightPx = if (trackHeightPx > 0) {
+        (trackHeightPx * visibleItems / totalItems)
+            .coerceAtLeast(minThumbHeightPx)
+            .coerceAtMost(trackHeightPx)
+    } else {
+        minThumbHeightPx
+    }
+    val availableThumbTravelPx = (trackHeightPx - thumbHeightPx).coerceAtLeast(1)
+    val scrollableItems = (totalItems - visibleItems).coerceAtLeast(1)
+    val thumbOffsetPx = (availableThumbTravelPx * listState.firstVisibleItemIndex / scrollableItems)
+        .coerceIn(0, availableThumbTravelPx)
+    val displayedThumbOffsetPx = draggingThumbOffsetPx?.roundToInt() ?: thumbOffsetPx
+
+    fun scrollToThumbOffset(offsetPx: Float) {
+        val boundedOffset = offsetPx.coerceIn(0f, availableThumbTravelPx.toFloat())
+        draggingThumbOffsetPx = boundedOffset
+        val targetIndex = (boundedOffset / availableThumbTravelPx * scrollableItems).roundToInt()
+        scope.launch {
+            listState.scrollToItem(targetIndex.coerceIn(0, totalItems - 1))
+        }
+    }
+
+    Box(
+        modifier = modifier
+            .width(18.dp)
+            .fillMaxSize()
+            .onSizeChanged { trackHeightPx = it.height }
+            .pointerInput(totalItems, visibleItems, trackHeightPx) {
+                detectVerticalDragGestures(
+                    onDragStart = { offset ->
+                        scrollToThumbOffset(offset.y - thumbHeightPx / 2f)
+                    },
+                    onVerticalDrag = { change, dragAmount ->
+                        change.consume()
+                        scrollToThumbOffset((draggingThumbOffsetPx ?: thumbOffsetPx.toFloat()) + dragAmount)
+                    },
+                    onDragEnd = { draggingThumbOffsetPx = null },
+                    onDragCancel = { draggingThumbOffsetPx = null }
+                )
+            },
+        contentAlignment = Alignment.TopCenter
+    ) {
+        Box(
+            modifier = Modifier
+                .width(4.dp)
+                .fillMaxSize()
+                .clip(RoundedCornerShape(2.dp))
+                .background(Color(0x332F2F45))
+        )
+        Box(
+            modifier = Modifier
+                .padding(top = with(density) { displayedThumbOffsetPx.toDp() })
+                .width(8.dp)
+                .height(with(density) { thumbHeightPx.toDp() })
+                .clip(RoundedCornerShape(4.dp))
+                .background(Color(0xFF8E6BD8))
         )
     }
 }
