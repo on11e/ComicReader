@@ -71,6 +71,50 @@ private const val LOCAL_BOOKS_SNAPSHOT_PREF_KEY = "local_books_snapshot"
 internal const val READER_DEFAULT_VERTICAL_MODE_KEY = "reader_default_vertical_mode"
 internal const val READER_DEFAULT_PAGE_GAP_DP_KEY = "reader_default_page_gap_dp"
 
+internal fun readChapterIdsKey(bookId: String): String = "${bookId}_read_chapter_ids"
+internal fun unfinishedChapterIdKey(bookId: String): String = "${bookId}_unfinished_chapter_id"
+internal fun unfinishedPageIndexKey(bookId: String): String = "${bookId}_unfinished_page_index"
+internal fun legacyLastChapterIdKey(bookId: String): String = "${bookId}_last_chapter_id"
+
+internal fun readChapterIds(sharedPrefs: SharedPreferences, bookId: String): Set<String> {
+    return sharedPrefs.getStringSet(readChapterIdsKey(bookId), emptySet()).orEmpty()
+}
+
+internal fun markChapterRead(sharedPrefs: SharedPreferences, bookId: String, chapterId: String) {
+    sharedPrefs.edit {
+        putStringSet(readChapterIdsKey(bookId), readChapterIds(sharedPrefs, bookId) + chapterId)
+    }
+}
+
+internal fun saveUnfinishedPosition(
+    sharedPrefs: SharedPreferences,
+    bookId: String,
+    chapterId: String,
+    pageIndex: Int
+) {
+    sharedPrefs.edit {
+        putString(unfinishedChapterIdKey(bookId), chapterId)
+        putInt(unfinishedPageIndexKey(bookId), pageIndex.coerceAtLeast(0))
+        putString(legacyLastChapterIdKey(bookId), chapterId)
+    }
+}
+
+internal fun clearUnfinishedPosition(sharedPrefs: SharedPreferences, bookId: String) {
+    sharedPrefs.edit {
+        remove(unfinishedChapterIdKey(bookId))
+        remove(unfinishedPageIndexKey(bookId))
+    }
+}
+
+internal fun resetReadingRecords(sharedPrefs: SharedPreferences, bookId: String) {
+    sharedPrefs.edit {
+        remove(readChapterIdsKey(bookId))
+        remove(unfinishedChapterIdKey(bookId))
+        remove(unfinishedPageIndexKey(bookId))
+        remove(legacyLastChapterIdKey(bookId))
+    }
+}
+
 @Composable
 internal fun MainAppScreen() {
     val context = LocalContext.current
@@ -556,7 +600,10 @@ private fun clearBookMetadata(sharedPrefs: SharedPreferences, bookId: String) {
         remove("${bookId}_open_externally")
         remove("${bookId}_external_url")
         remove("${bookId}_custom_cover_uri")
-        remove("${bookId}_last_chapter_id")
+        remove(readChapterIdsKey(bookId))
+        remove(unfinishedChapterIdKey(bookId))
+        remove(unfinishedPageIndexKey(bookId))
+        remove(legacyLastChapterIdKey(bookId))
     }
 }
 
@@ -616,6 +663,9 @@ private fun migrateBookMetadata(sharedPrefs: SharedPreferences, oldBookId: Strin
         "_open_externally",
         "_external_url",
         "_custom_cover_uri",
+        "_read_chapter_ids",
+        "_unfinished_chapter_id",
+        "_unfinished_page_index",
         "_last_chapter_id",
         "_asset_sync_signature"
     )
@@ -685,18 +735,21 @@ private suspend fun renameComicChapter(
         if (sanitizedName == chapterDocument.name) return@withContext true
 
         val oldChapterId = chapter.id
-        val oldProgress = sharedPrefs.getInt(oldChapterId, -1)
-        val oldLastChapterId = sharedPrefs.getString("${book.id}_last_chapter_id", null)
+        val oldReadChapterIds = readChapterIds(sharedPrefs, book.id)
+        val oldUnfinishedChapterId = sharedPrefs.getString(unfinishedChapterIdKey(book.id), null)
+        val oldLastChapterId = sharedPrefs.getString(legacyLastChapterIdKey(book.id), null)
         val renamedUri = renameChapterDocument(context, book, chapter, chapterDocument, sanitizedName)
         if (renamedUri != null) {
             val newChapterId = renamedUri.toString()
             sharedPrefs.edit {
-                if (oldProgress >= 0) {
-                    putInt(newChapterId, oldProgress)
-                    remove(oldChapterId)
+                if (oldReadChapterIds.contains(oldChapterId)) {
+                    putStringSet(readChapterIdsKey(book.id), (oldReadChapterIds - oldChapterId) + newChapterId)
+                }
+                if (oldUnfinishedChapterId == oldChapterId) {
+                    putString(unfinishedChapterIdKey(book.id), newChapterId)
                 }
                 if (oldLastChapterId == oldChapterId) {
-                    putString("${book.id}_last_chapter_id", newChapterId)
+                    putString(legacyLastChapterIdKey(book.id), newChapterId)
                 }
                 remove("${book.id}_asset_sync_signature")
             }
@@ -1045,7 +1098,16 @@ internal fun normalizeTags(rawTags: String): List<String> {
 }
 
 internal fun resolveLastChapterIndex(sharedPrefs: SharedPreferences, book: ComicBook): Int {
-    val lastChapterId = sharedPrefs.getString("${book.id}_last_chapter_id", null) ?: return 0
+    val unfinishedChapterId = sharedPrefs.getString(unfinishedChapterIdKey(book.id), null)
+    if (unfinishedChapterId != null) {
+        return book.chapters.indexOfFirst { it.id == unfinishedChapterId }.takeIf { it >= 0 } ?: 0
+    }
+
+    val readIds = readChapterIds(sharedPrefs, book.id)
+    val firstUnreadIndex = book.chapters.indexOfFirst { it.id !in readIds }
+    if (firstUnreadIndex >= 0) return firstUnreadIndex
+
+    val lastChapterId = sharedPrefs.getString(legacyLastChapterIdKey(book.id), null) ?: return 0
     return book.chapters.indexOfFirst { it.id == lastChapterId }.takeIf { it >= 0 } ?: 0
 }
 

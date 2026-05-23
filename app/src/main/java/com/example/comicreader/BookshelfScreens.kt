@@ -13,15 +13,18 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
@@ -547,7 +550,7 @@ private fun BookCard(
                 }
             )
         } else {
-            EditBookMetadataDialog(
+            ModernEditBookMetadataDialog(
                 book = book,
                 initialMetadata = metadata,
                 onDismiss = { showEditDialog = false },
@@ -1180,7 +1183,7 @@ internal fun BookDetailScreen(
                 }
             )
         } else {
-            EditBookMetadataDialog(
+            ModernEditBookMetadataDialog(
                 book = book,
                 initialMetadata = metadata,
                 onDismiss = { showEditDialog = false },
@@ -1230,7 +1233,9 @@ private fun BookDetailFixedContent(
     onRenameChapter: (ComicChapter) -> Unit
 ) {
     val context = LocalContext.current
+    val sharedPrefs = remember { context.getSharedPreferences("comic_progress_prefs", Context.MODE_PRIVATE) }
     val chapterListState = rememberLazyListState()
+    val readChapterIdSet = readChapterIds(sharedPrefs, book.id)
 
     Column(
         modifier = Modifier
@@ -1339,6 +1344,7 @@ private fun BookDetailFixedContent(
                         var isChapterPressed by remember(chapter.id) { mutableStateOf(false) }
                         val canRenameChapter = !(chapter.id.endsWith("#root") && chapter.sourceUri == book.uri)
                         val isSelectedChapter = index == selectedChapterIndex
+                        val isReadChapter = chapter.id in readChapterIdSet
                         val chapterPressScale by animateFloatAsState(
                             targetValue = if (isChapterPressed) 0.98f else 1f,
                             label = "chapterRowPressScale"
@@ -1391,7 +1397,7 @@ private fun BookDetailFixedContent(
                                 modifier = Modifier
                                     .fillMaxWidth()
                                     .padding(horizontal = 12.dp, vertical = 7.dp),
-                                color = Color.White,
+                                color = if (isReadChapter && !isSelectedChapter) Color(0xFF777785) else Color.White,
                                 fontSize = 14.sp,
                                 fontWeight = if (isSelectedChapter) FontWeight.Bold else FontWeight.Medium,
                                 maxLines = 1,
@@ -1598,6 +1604,16 @@ private fun EditBookMetadataDialog(
                     }
                     Switch(checked = autoNextChapter, onCheckedChange = { autoNextChapter = it })
                 }
+                OutlinedButton(
+                    onClick = {
+                        resetReadingRecords(sharedPrefs, book.id)
+                        Toast.makeText(context, "阅读记录已重置", Toast.LENGTH_SHORT).show()
+                        onSaved()
+                    },
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text("重置阅读记录")
+                }
             }
         },
         confirmButton = {
@@ -1628,4 +1644,269 @@ private fun EditBookMetadataDialog(
             TextButton(onClick = onDismiss) { Text("取消") }
         }
     )
+}
+
+@Composable
+private fun ModernEditBookMetadataDialog(
+    book: ComicBook,
+    initialMetadata: BookMetadata,
+    onDismiss: () -> Unit,
+    onSaved: () -> Unit
+) {
+    val context = LocalContext.current
+    val sharedPrefs = remember { context.getSharedPreferences("comic_progress_prefs", Context.MODE_PRIVATE) }
+
+    var inputName by remember { mutableStateOf(initialMetadata.customName) }
+    var inputDesc by remember { mutableStateOf(initialMetadata.customDesc) }
+    var inputTags by remember { mutableStateOf(initialMetadata.tags.joinToString(", ")) }
+    var inputCoverPage by remember { mutableStateOf(initialMetadata.coverPage.toString()) }
+    var autoNextChapter by remember { mutableStateOf(initialMetadata.autoNextChapter) }
+    var inputExternalUrl by remember { mutableStateOf(initialMetadata.externalUrl) }
+    var inputCoverUri by remember { mutableStateOf(initialMetadata.customCoverUri) }
+    var showResetConfirm by remember { mutableStateOf(false) }
+
+    val imagePicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) {
+            saveCoverToAppStorage(context, uri)?.let { storedUri ->
+                inputCoverUri = storedUri
+            } ?: Toast.makeText(context, "封面保存失败，请重新选择图片", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = Color(0xFF231936),
+        title = {
+            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Text("编辑漫画资料", color = Color.White, fontWeight = FontWeight.Bold)
+                Text("基础信息、封面来源、阅读设置", color = Color(0xFF9C9CAA), fontSize = 12.sp)
+            }
+        },
+        text = {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = 520.dp)
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                MetadataSection(title = "基础信息") {
+                    CompactMetadataTextField(
+                        value = inputName,
+                        onValueChange = { inputName = it },
+                        label = "漫画名称"
+                    )
+                    CompactMetadataTextField(
+                        value = inputDesc,
+                        onValueChange = { inputDesc = it },
+                        label = "简介",
+                        singleLine = false,
+                        maxLines = 2
+                    )
+                    CompactMetadataTextField(
+                        value = inputTags,
+                        onValueChange = { inputTags = it },
+                        label = "标签，使用逗号分隔"
+                    )
+                }
+
+                MetadataSection(title = "封面与来源") {
+                    CompactMetadataTextField(
+                        value = inputCoverPage,
+                        onValueChange = { inputCoverPage = it },
+                        label = "封面页码"
+                    )
+                    Text(
+                        text = if (inputCoverUri.isBlank()) {
+                            "未选择自定义封面，将使用封面页码。"
+                        } else {
+                            inputCoverUri
+                        },
+                        color = Color(0xFFC6C6D4),
+                        fontSize = 12.sp,
+                        lineHeight = 18.sp
+                    )
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Button(
+                            onClick = { imagePicker.launch(arrayOf("image/*")) },
+                            modifier = Modifier.height(38.dp),
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = Color(0xFFFFD34D),
+                                contentColor = Color(0xFF17110A)
+                            )
+                        ) {
+                            Text("选择图片", fontWeight = FontWeight.Bold)
+                        }
+                        if (inputCoverUri.isNotBlank()) {
+                            OutlinedButton(
+                                onClick = { inputCoverUri = "" },
+                                modifier = Modifier.height(38.dp),
+                                border = BorderStroke(1.dp, Color(0xFFFFD34D)),
+                                colors = ButtonDefaults.outlinedButtonColors(contentColor = Color(0xFFFFD34D))
+                            ) {
+                                Text("清除")
+                            }
+                        }
+                    }
+                    CompactMetadataTextField(
+                        value = inputExternalUrl,
+                        onValueChange = { inputExternalUrl = it },
+                        label = "来源网站地址（可选）"
+                    )
+                }
+
+                MetadataSection(title = "阅读设置") {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth(0.72f)
+                                .padding(end = 12.dp)
+                        ) {
+                            Text("章节结尾自动进入下一章", color = Color.White, fontSize = 14.sp)
+                            Text("关闭后会在本章结束时弹出提示", color = Color(0xFF9C9CAA), fontSize = 12.sp)
+                        }
+                        Switch(checked = autoNextChapter, onCheckedChange = { autoNextChapter = it })
+                    }
+                }
+
+                Card(
+                    colors = CardDefaults.cardColors(containerColor = Color(0xFF332245)),
+                    border = BorderStroke(1.dp, Color(0xFFFFD34D)),
+                    shape = RoundedCornerShape(10.dp)
+                ) {
+                    Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text("阅读进度重置", color = Color(0xFFFFD34D), fontWeight = FontWeight.Bold)
+                        Text(
+                            "清空已读章节标记和未完成页码，漫画资料不会被修改。",
+                            color = Color(0xFFD8CFF0),
+                            fontSize = 12.sp,
+                            lineHeight = 18.sp
+                        )
+                        Button(
+                            onClick = { showResetConfirm = true },
+                            modifier = Modifier.fillMaxWidth(),
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = Color(0xFFFFD34D),
+                                contentColor = Color(0xFF17110A)
+                            )
+                        ) {
+                            Text("重置阅读进度", fontWeight = FontWeight.Bold)
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = {
+                    val externalUrl = inputExternalUrl.trim()
+                    if (externalUrl.isNotBlank() && !isValidExternalUrl(externalUrl)) {
+                        Toast.makeText(context, "外链地址必须以 http:// 或 https:// 开头", Toast.LENGTH_SHORT).show()
+                        return@Button
+                    }
+                    val coverPage = inputCoverPage.toIntOrNull()?.coerceAtLeast(1) ?: 1
+                    sharedPrefs.edit {
+                        putString("${book.id}_custom_name", inputName.trim().ifEmpty { book.name })
+                        putString("${book.id}_custom_desc", inputDesc.trim())
+                        putString("${book.id}_tags", normalizeTags(inputTags).joinToString(","))
+                        putInt("${book.id}_cover_index", coverPage)
+                        putBoolean("${book.id}_auto_next", autoNextChapter)
+                        putBoolean("${book.id}_external_only", false)
+                        putBoolean("${book.id}_open_externally", false)
+                        putString("${book.id}_external_url", externalUrl)
+                        putString("${book.id}_custom_cover_uri", inputCoverUri.trim())
+                    }
+                    onSaved()
+                },
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = Color(0xFFFFD34D),
+                    contentColor = Color(0xFF17110A)
+                )
+            ) { Text("保存", fontWeight = FontWeight.Bold) }
+        },
+        dismissButton = {
+            TextButton(
+                onClick = onDismiss,
+                colors = ButtonDefaults.textButtonColors(contentColor = Color(0xFFFFD34D))
+            ) { Text("取消") }
+        }
+    )
+
+    if (showResetConfirm) {
+        AlertDialog(
+            onDismissRequest = { showResetConfirm = false },
+            containerColor = Color(0xFF231936),
+            title = { Text("重置阅读进度？", color = Color.White, fontWeight = FontWeight.Bold) },
+            text = {
+                Text(
+                    "这会清空已读章节标记和当前未完成页码。漫画名称、简介、封面等资料不会改变。",
+                    color = Color(0xFFC6C6D4)
+                )
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        resetReadingRecords(sharedPrefs, book.id)
+                        Toast.makeText(context, "阅读进度已重置", Toast.LENGTH_SHORT).show()
+                        showResetConfirm = false
+                        onSaved()
+                    },
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = Color(0xFFFFD34D),
+                        contentColor = Color(0xFF17110A)
+                    )
+                ) {
+                    Text("确认重置", fontWeight = FontWeight.Bold)
+                }
+            },
+            dismissButton = {
+                TextButton(
+                    onClick = { showResetConfirm = false },
+                    colors = ButtonDefaults.textButtonColors(contentColor = Color(0xFFFFD34D))
+                ) { Text("取消") }
+            }
+        )
+    }
+}
+
+@Composable
+private fun CompactMetadataTextField(
+    value: String,
+    onValueChange: (String) -> Unit,
+    label: String,
+    modifier: Modifier = Modifier,
+    singleLine: Boolean = true,
+    maxLines: Int = 1
+) {
+    TextField(
+        value = value,
+        onValueChange = onValueChange,
+        label = { Text(label, fontSize = 12.sp) },
+        singleLine = singleLine,
+        maxLines = maxLines,
+        modifier = modifier
+            .fillMaxWidth()
+            .height(if (singleLine) 56.dp else 72.dp)
+    )
+}
+
+@Composable
+private fun MetadataSection(
+    title: String,
+    content: @Composable ColumnScope.() -> Unit
+) {
+    Card(
+        colors = CardDefaults.cardColors(containerColor = Color(0xFF2D2246)),
+        border = BorderStroke(1.dp, Color(0xFF6D55A6)),
+        shape = RoundedCornerShape(10.dp)
+    ) {
+        Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text(title, color = Color(0xFFFFD34D), fontWeight = FontWeight.Bold)
+            content()
+        }
+    }
 }

@@ -95,6 +95,15 @@ private const val DEFAULT_PAGE_GAP_DP = 10f
 private const val LONG_IMAGE_HEIGHT_THRESHOLD_PX = 8192
 private const val LONG_IMAGE_ASPECT_RATIO_THRESHOLD = 4f
 private const val LONG_IMAGE_SLICE_HEIGHT_PX = 2048
+private const val NEXT_CHAPTER_COMMIT_PAGE_THRESHOLD = 5
+
+private data class ReaderPageRef(
+    val chapterIndex: Int,
+    val chapter: ComicChapter,
+    val pageIndex: Int,
+    val page: Any,
+    val cacheZipFile: File
+)
 
 @Composable
 internal fun ComicReaderScreen(
@@ -122,14 +131,20 @@ internal fun ComicReaderScreen(
         mutableIntStateOf(initialChapterIndex.coerceIn(0, book.chapters.lastIndex))
     }
     var chapterPages by remember { mutableStateOf<List<Any>>(emptyList()) }
+    var nextChapterPages by remember { mutableStateOf<List<Any>>(emptyList()) }
+    var appendedChapterPages by remember { mutableStateOf<Map<Int, List<Any>>>(emptyMap()) }
     var isLoading by remember { mutableStateOf(true) }
     var showControls by remember { mutableStateOf(false) }
     var sliderValue by remember { mutableFloatStateOf(0f) }
     var showRestartPrompt by remember { mutableStateOf(false) }
     var dismissNextChapterPrompt by remember { mutableStateOf(false) }
+    var pendingChapterJump by remember { mutableStateOf<Pair<Int, Int>?>(null) }
 
     val currentChapter = book.chapters[currentChapterIndex]
-    val cacheZipFile = remember(currentChapter.id) { File(context.cacheDir, "reader_${currentChapter.id.hashCode()}.zip") }
+    fun chapterCacheZipFile(chapter: ComicChapter): File {
+        return File(context.cacheDir, "reader_${chapter.id.hashCode()}.zip")
+    }
+    val cacheZipFile = remember(currentChapter.id) { chapterCacheZipFile(currentChapter) }
     val metadata = remember(book.id) { readBookMetadata(sharedPrefs, book) }
 
     LaunchedEffect(Unit) {
@@ -150,23 +165,42 @@ internal fun ComicReaderScreen(
         }
     }
 
-    LaunchedEffect(currentChapter.id) {
-        isLoading = true
-        dismissNextChapterPrompt = false
-        chapterPages = if (currentChapter.isZip) {
-            if (ComicParser.copyZipToCache(context, currentChapter.sourceUri, cacheZipFile)) {
-                ComicParser.getPagesFromZip(cacheZipFile)
+    suspend fun loadChapterPages(chapter: ComicChapter, chapterCacheZipFile: File): List<Any> {
+        return if (chapter.isZip) {
+            if (ComicParser.copyZipToCache(context, chapter.sourceUri, chapterCacheZipFile)) {
+                ComicParser.getPagesFromZip(chapterCacheZipFile)
             } else {
                 emptyList()
             }
         } else {
-            ComicParser.getComicPagesFromFolder(context, currentChapter.sourceUri)
+            ComicParser.getComicPagesFromFolder(context, chapter.sourceUri)
         }
-        val savedPage = sharedPrefs.getInt(currentChapter.id, 0)
+    }
+
+    LaunchedEffect(currentChapter.id) {
+        isLoading = true
+        dismissNextChapterPrompt = false
+        nextChapterPages = emptyList()
+        appendedChapterPages = emptyMap()
+        chapterPages = loadChapterPages(currentChapter, cacheZipFile)
+        val unfinishedChapterId = sharedPrefs.getString(unfinishedChapterIdKey(book.id), null)
+        val savedPage = if (unfinishedChapterId == currentChapter.id) {
+            sharedPrefs.getInt(unfinishedPageIndexKey(book.id), 0)
+        } else {
+            0
+        }
         sliderValue = savedPage.toFloat()
         showRestartPrompt = savedPage > 0
-        sharedPrefs.edit { putString("${book.id}_last_chapter_id", currentChapter.id) }
+        if (unfinishedChapterId != currentChapter.id) {
+            saveUnfinishedPosition(sharedPrefs, book.id, currentChapter.id, 0)
+        } else {
+            sharedPrefs.edit { putString(legacyLastChapterIdKey(book.id), currentChapter.id) }
+        }
         isLoading = false
+        if (metadata.autoNextChapter && currentChapterIndex < book.chapters.lastIndex) {
+            val nextChapter = book.chapters[currentChapterIndex + 1]
+            nextChapterPages = loadChapterPages(nextChapter, chapterCacheZipFile(nextChapter))
+        }
     }
 
     LaunchedEffect(showRestartPrompt) {
@@ -194,9 +228,55 @@ internal fun ComicReaderScreen(
         return
     }
 
-    val totalPages = chapterPages.size
-    val savedPage = sharedPrefs.getInt(currentChapter.id, 0).coerceIn(0, totalPages - 1)
     val autoNextChapter = metadata.autoNextChapter
+    val currentChapterPageRefs = chapterPages.mapIndexed { index, page ->
+        ReaderPageRef(
+            chapterIndex = currentChapterIndex,
+            chapter = currentChapter,
+            pageIndex = index,
+            page = page,
+            cacheZipFile = cacheZipFile
+        )
+    }
+    val nextChapter = book.chapters.getOrNull(currentChapterIndex + 1)
+    val nextChapterPageRefs = if (autoNextChapter && nextChapter != null) {
+        val nextCacheZipFile = chapterCacheZipFile(nextChapter)
+        nextChapterPages.mapIndexed { index, page ->
+            ReaderPageRef(
+                chapterIndex = currentChapterIndex + 1,
+                chapter = nextChapter,
+                pageIndex = index,
+                page = page,
+                cacheZipFile = nextCacheZipFile
+            )
+        }
+    } else {
+        emptyList()
+    }
+    val appendedChapterPageRefs = if (autoNextChapter) {
+        appendedChapterPages.toSortedMap().flatMap { (chapterIndex, pages) ->
+            val chapter = book.chapters.getOrNull(chapterIndex) ?: return@flatMap emptyList()
+            val chapterCacheZipFile = chapterCacheZipFile(chapter)
+            pages.mapIndexed { index, page ->
+                ReaderPageRef(
+                    chapterIndex = chapterIndex,
+                    chapter = chapter,
+                    pageIndex = index,
+                    page = page,
+                    cacheZipFile = chapterCacheZipFile
+                )
+            }
+        }
+    } else {
+        emptyList()
+    }
+    val readerPages = currentChapterPageRefs + nextChapterPageRefs + appendedChapterPageRefs
+    val totalPages = readerPages.size.coerceAtLeast(1)
+    val savedPage = if (sharedPrefs.getString(unfinishedChapterIdKey(book.id), null) == currentChapter.id) {
+        sharedPrefs.getInt(unfinishedPageIndexKey(book.id), 0)
+    } else {
+        0
+    }.coerceIn(0, totalPages - 1)
 
     key(currentChapter.id, isVerticalMode) {
         var readerScale by remember(currentChapter.id, isVerticalMode) { mutableFloatStateOf(1f) }
@@ -264,16 +344,38 @@ internal fun ComicReaderScreen(
         var sliderSeekJob by remember(currentChapter.id, isVerticalMode) { mutableStateOf<Job?>(null) }
         var lastSliderTargetPage by remember(currentChapter.id, isVerticalMode) { mutableIntStateOf(savedPage) }
         var isSliderDragging by remember(currentChapter.id, isVerticalMode) { mutableStateOf(false) }
+        var sliderDragChapterIndex by remember(currentChapter.id, isVerticalMode) { mutableStateOf<Int?>(null) }
         val currentPageIndex = if (isVerticalMode) {
             listState.firstVisibleItemIndex.coerceIn(0, totalPages - 1)
         } else {
             pagerState.currentPage.coerceIn(0, totalPages - 1)
         }
+        val currentPageRef = readerPages[currentPageIndex]
+        fun pageCountForChapter(chapterIndex: Int): Int {
+            return when (chapterIndex) {
+                currentChapterIndex -> chapterPages.size
+                currentChapterIndex + 1 -> nextChapterPages.size
+                else -> appendedChapterPages[chapterIndex]?.size ?: 0
+            }
+        }
+        fun firstReaderPageIndexForChapter(chapterIndex: Int): Int {
+            return readerPages.indexOfFirst { it.chapterIndex == chapterIndex }.coerceAtLeast(0)
+        }
+        fun readerPageIndexForChapterOrNull(chapterIndex: Int): Int? {
+            return readerPages.indexOfFirst { it.chapterIndex == chapterIndex }.takeIf { it >= 0 }
+        }
+        val sliderChapterIndex = sliderDragChapterIndex ?: currentPageRef.chapterIndex
+        val sliderChapterPageCount = pageCountForChapter(sliderChapterIndex).coerceAtLeast(1)
+        val sliderRangeEnd = (sliderChapterPageCount - 1).toFloat().coerceAtLeast(1f)
+        val coercedSliderValue = sliderValue.coerceIn(0f, sliderRangeEnd)
         val displayedPageIndex = if (isSliderDragging) {
-            sliderValue.roundToInt().coerceIn(0, totalPages - 1)
+            val localPage = sliderValue.roundToInt().coerceIn(0, sliderChapterPageCount - 1)
+            firstReaderPageIndexForChapter(sliderChapterIndex) + localPage
         } else {
             currentPageIndex
-        }
+        }.coerceIn(0, totalPages - 1)
+        val displayedPageRef = readerPages[displayedPageIndex]
+        val displayedChapterPageCount = pageCountForChapter(displayedPageRef.chapterIndex).coerceAtLeast(1)
         suspend fun scrollVerticalPageIntoControlSafePosition(targetPage: Int) {
             listState.scrollToItem(targetPage)
             withFrameNanos { }
@@ -289,15 +391,32 @@ internal fun ComicReaderScreen(
             }
         }
         suspend fun scrollHorizontalPageWithPrefetch(targetPage: Int) {
-            if (currentChapter.isZip) {
-                (chapterPages.getOrNull(targetPage) as? String)?.let { pageName ->
-                    ComicParser.getZipPageBitmap(cacheZipFile, pageName)
+            val targetPageRef = readerPages.getOrNull(targetPage)
+            if (targetPageRef?.chapter?.isZip == true) {
+                (targetPageRef.page as? String)?.let { pageName ->
+                    ComicParser.getZipPageBitmap(targetPageRef.cacheZipFile, pageName)
                 }
             }
             pagerState.scrollToPage(targetPage)
         }
+        suspend fun scrollReaderPageToTop(targetPage: Int) {
+            if (isVerticalMode) {
+                listState.scrollToItem(targetPage, 0)
+                withFrameNanos { }
+                if (listState.firstVisibleItemIndex != targetPage) {
+                    listState.scrollToItem(targetPage, 0)
+                }
+            } else {
+                scrollHorizontalPageWithPrefetch(targetPage)
+            }
+        }
         fun seekToSliderPage(value: Float, force: Boolean = false) {
-            val targetPage = value.roundToInt().coerceIn(0, totalPages - 1)
+            val targetChapterIndex = sliderDragChapterIndex ?: currentPageRef.chapterIndex
+            val targetChapterPageCount = pageCountForChapter(targetChapterIndex).coerceAtLeast(1)
+            val targetPage = (
+                firstReaderPageIndexForChapter(targetChapterIndex) +
+                    value.roundToInt().coerceIn(0, targetChapterPageCount - 1)
+                ).coerceIn(0, totalPages - 1)
             if (!force && targetPage == lastSliderTargetPage) return
             lastSliderTargetPage = targetPage
             sliderSeekJob?.cancel()
@@ -322,31 +441,93 @@ internal fun ComicReaderScreen(
                 scrollHorizontalPageWithPrefetch(targetPage)
             }
         }
+        fun navigateChapterFromVisible(delta: Int) {
+            val targetChapterIndex = (currentPageRef.chapterIndex + delta).coerceIn(0, book.chapters.lastIndex)
+            if (targetChapterIndex == currentPageRef.chapterIndex) return
+            sliderSeekJob?.cancel()
+            sliderDragChapterIndex = null
+            isSliderDragging = false
+            resetReaderZoom()
+            readerPageIndexForChapterOrNull(targetChapterIndex)?.let { targetChapterFirstPage ->
+                val targetChapter = book.chapters[targetChapterIndex]
+                saveUnfinishedPosition(sharedPrefs, book.id, targetChapter.id, 0)
+                pendingChapterJump = targetChapterIndex to 0
+                val targetPage = targetChapterFirstPage.coerceIn(0, totalPages - 1)
+                sliderValue = 0f
+                lastSliderTargetPage = targetPage
+                sliderSeekJob = scope.launch {
+                    scrollReaderPageToTop(targetPage)
+                }
+                return
+            }
+            saveUnfinishedPosition(sharedPrefs, book.id, book.chapters[targetChapterIndex].id, 0)
+            pendingChapterJump = targetChapterIndex to 0
+            isLoading = true
+            currentChapterIndex = targetChapterIndex
+        }
+
+        LaunchedEffect(pendingChapterJump, readerPages.size, currentChapter.id, isVerticalMode) {
+            val pendingJump = pendingChapterJump ?: return@LaunchedEffect
+            val targetChapterIndex = pendingJump.first
+            val targetPageIndex = pendingJump.second
+            val targetChapterFirstPage = readerPageIndexForChapterOrNull(targetChapterIndex) ?: return@LaunchedEffect
+            val targetPage = (targetChapterFirstPage + targetPageIndex).coerceIn(0, totalPages - 1)
+            sliderSeekJob?.cancel()
+            lastSliderTargetPage = targetPage
+            sliderValue = targetPageIndex.toFloat()
+            scrollReaderPageToTop(targetPage)
+            pendingChapterJump = null
+        }
 
         LaunchedEffect(currentPageIndex, currentChapter.id) {
+            if (pendingChapterJump != null) return@LaunchedEffect
             if (!isSliderDragging) {
-                sliderValue = currentPageIndex.toFloat()
+                sliderValue = currentPageRef.pageIndex.toFloat()
             }
             lastSliderTargetPage = currentPageIndex
-            sharedPrefs.edit {
-                putInt(currentChapter.id, currentPageIndex)
-                putString("${book.id}_last_chapter_id", currentChapter.id)
+            val currentPageChapterPageCount = pageCountForChapter(currentPageRef.chapterIndex).coerceAtLeast(1)
+            val isCurrentPageChapterComplete = currentPageRef.pageIndex >= currentPageChapterPageCount - 1
+            val shouldCommitVisibleChapter =
+                currentPageRef.chapterIndex == currentChapterIndex ||
+                    currentPageRef.pageIndex + 1 >= NEXT_CHAPTER_COMMIT_PAGE_THRESHOLD.coerceAtMost(
+                        currentPageChapterPageCount
+                    )
+            if (isCurrentPageChapterComplete) {
+                markChapterRead(sharedPrefs, book.id, currentPageRef.chapter.id)
+                if (sharedPrefs.getString(unfinishedChapterIdKey(book.id), null) == currentPageRef.chapter.id) {
+                    clearUnfinishedPosition(sharedPrefs, book.id)
+                }
+                sharedPrefs.edit { putString(legacyLastChapterIdKey(book.id), currentPageRef.chapter.id) }
+            } else if (shouldCommitVisibleChapter) {
+                saveUnfinishedPosition(sharedPrefs, book.id, currentPageRef.chapter.id, currentPageRef.pageIndex)
             }
-            if (currentPageIndex < totalPages - 1) {
+            if (autoNextChapter && shouldCommitVisibleChapter) {
+                val chapterToAppendIndex = currentPageRef.chapterIndex + 1
+                if (
+                    chapterToAppendIndex > currentChapterIndex + 1 &&
+                    chapterToAppendIndex <= book.chapters.lastIndex &&
+                    !appendedChapterPages.containsKey(chapterToAppendIndex)
+                ) {
+                    val chapterToAppend = book.chapters[chapterToAppendIndex]
+                    val pages = loadChapterPages(chapterToAppend, chapterCacheZipFile(chapterToAppend))
+                    appendedChapterPages = appendedChapterPages + (chapterToAppendIndex to pages)
+                }
+            }
+            if (currentPageRef.chapterIndex == currentChapterIndex && currentPageRef.pageIndex < chapterPages.size - 1) {
                 dismissNextChapterPrompt = false
-            }
-            if (autoNextChapter && currentPageIndex == totalPages - 1 && currentChapterIndex < book.chapters.lastIndex) {
-                currentChapterIndex += 1
             }
         }
 
-        LaunchedEffect(currentPageIndex, currentChapter.id, currentChapter.isZip, isVerticalMode) {
-            if (currentChapter.isZip && !isVerticalMode) {
+        LaunchedEffect(currentPageIndex, currentChapter.id, isVerticalMode) {
+            if (!isVerticalMode) {
                 listOf(currentPageIndex - 1, currentPageIndex + 1)
                     .filter { it in 0 until totalPages }
                     .forEach { pageIndex ->
-                        (chapterPages.getOrNull(pageIndex) as? String)?.let { pageName ->
-                            ComicParser.getZipPageBitmap(cacheZipFile, pageName)
+                        val pageRef = readerPages[pageIndex]
+                        if (pageRef.chapter.isZip) {
+                            (pageRef.page as? String)?.let { pageName ->
+                                ComicParser.getZipPageBitmap(pageRef.cacheZipFile, pageName)
+                            }
                         }
                     }
             }
@@ -410,11 +591,11 @@ internal fun ComicReaderScreen(
                         },
                     verticalArrangement = Arrangement.spacedBy(if (hasPageGap) pageGapDp.dp else 0.dp)
                 ) {
-                    itemsIndexed(chapterPages, key = { index, _ -> "${currentChapter.id}#$index" }) { _, page ->
+                    itemsIndexed(readerPages, key = { _, pageRef -> "${pageRef.chapter.id}#${pageRef.pageIndex}" }) { _, pageRef ->
                         ReaderImage(
-                            page = page,
-                            isFolder = !currentChapter.isZip,
-                            cacheZipFile = cacheZipFile,
+                            page = pageRef.page,
+                            isFolder = !pageRef.chapter.isZip,
+                            cacheZipFile = pageRef.cacheZipFile,
                             isFullScreen = false
                         )
                     }
@@ -432,10 +613,11 @@ internal fun ComicReaderScreen(
                             translationY = readerOffsetY
                         }
                 ) { pageIndex ->
+                    val pageRef = readerPages[pageIndex]
                     ReaderImage(
-                        page = chapterPages[pageIndex],
-                        isFolder = !currentChapter.isZip,
-                        cacheZipFile = cacheZipFile,
+                        page = pageRef.page,
+                        isFolder = !pageRef.chapter.isZip,
+                        cacheZipFile = pageRef.cacheZipFile,
                         modifier = Modifier.fillMaxSize(),
                         isFullScreen = true
                     )
@@ -476,8 +658,8 @@ internal fun ComicReaderScreen(
             ) {
                 ReaderTopBar(
                     book = book,
-                    chapter = currentChapter,
-                    chapterIndex = currentChapterIndex,
+                    chapter = currentPageRef.chapter,
+                    chapterIndex = currentPageRef.chapterIndex,
                     chapterCount = book.chapters.size,
                     isVerticalMode = isVerticalMode,
                     hasPageGap = hasPageGap,
@@ -555,20 +737,29 @@ internal fun ComicReaderScreen(
                         .onSizeChanged { bottomControlsHeightPx = it.height },
                     horizontalAlignment = Alignment.CenterHorizontally
                 ) {
-                    Text(text = "第 ${displayedPageIndex + 1} / $totalPages 页", color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                    Text(
+                        text = "${displayedPageRef.chapter.name}  ${displayedPageRef.pageIndex + 1} / $displayedChapterPageCount",
+                        color = Color.White,
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.Bold
+                    )
                     Spacer(modifier = Modifier.height(6.dp))
                     Slider(
-                        value = sliderValue,
+                        value = coercedSliderValue,
                         onValueChange = {
+                            if (!isSliderDragging) {
+                                sliderDragChapterIndex = currentPageRef.chapterIndex
+                            }
                             isSliderDragging = true
                             sliderValue = it
                             seekToSliderPage(it)
                         },
                         onValueChangeFinished = {
-                            isSliderDragging = false
                             seekToSliderPage(sliderValue, force = true)
+                            isSliderDragging = false
+                            sliderDragChapterIndex = null
                         },
-                        valueRange = 0f..((totalPages - 1).toFloat().coerceAtLeast(1f)),
+                        valueRange = 0f..sliderRangeEnd,
                         colors = SliderDefaults.colors(
                             thumbColor = Color.White,
                             activeTrackColor = Color(0xFFBB86FC),
@@ -580,13 +771,13 @@ internal fun ComicReaderScreen(
                         Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                             ToolbarChipButton(
                                 text = "上一章",
-                                enabled = currentChapterIndex > 0,
-                                onClick = { if (currentChapterIndex > 0) currentChapterIndex -= 1 }
+                                enabled = currentPageRef.chapterIndex > 0,
+                                onClick = { navigateChapterFromVisible(-1) }
                             )
                             ToolbarChipButton(
                                 text = "下一章",
-                                enabled = currentChapterIndex < book.chapters.lastIndex,
-                                onClick = { if (currentChapterIndex < book.chapters.lastIndex) currentChapterIndex += 1 }
+                                enabled = currentPageRef.chapterIndex < book.chapters.lastIndex,
+                                onClick = { navigateChapterFromVisible(1) }
                             )
                         }
                     }
@@ -602,7 +793,7 @@ internal fun ComicReaderScreen(
                 Button(
                     onClick = {
                         showRestartPrompt = false
-                        sharedPrefs.edit { putInt(currentChapter.id, 0) }
+                        saveUnfinishedPosition(sharedPrefs, book.id, currentChapter.id, 0)
                         sliderValue = 0f
                         scope.launch {
                             if (isVerticalMode) listState.scrollToItem(0) else pagerState.scrollToPage(0)
@@ -618,7 +809,8 @@ internal fun ComicReaderScreen(
 
             val showNextChapterPrompt =
                 !autoNextChapter &&
-                    currentPageIndex == totalPages - 1 &&
+                    currentPageRef.chapterIndex == currentChapterIndex &&
+                    currentPageRef.pageIndex == chapterPages.size - 1 &&
                     currentChapterIndex < book.chapters.lastIndex &&
                     !dismissNextChapterPrompt
 
@@ -634,7 +826,7 @@ internal fun ComicReaderScreen(
                         Text("下一章：${book.chapters[currentChapterIndex + 1].name}", color = Color(0xFFCACAD7))
                         Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                             OutlinedButton(onClick = { dismissNextChapterPrompt = true }) { Text("停留本章") }
-                            Button(onClick = { currentChapterIndex += 1 }) { Text("进入下一章") }
+                            Button(onClick = { navigateChapterFromVisible(1) }) { Text("进入下一章") }
                         }
                     }
                 }
