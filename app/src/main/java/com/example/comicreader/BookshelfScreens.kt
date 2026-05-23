@@ -952,11 +952,14 @@ internal fun BookDetailScreen(
     metadata: BookMetadata,
     onBack: () -> Unit,
     onEditFinished: () -> Unit,
+    onRenameChapter: suspend (ComicChapter, String) -> Boolean,
     onReadChapter: (Int) -> Unit
 ) {
     val context = LocalContext.current
     val sharedPrefs = remember { context.getSharedPreferences("comic_progress_prefs", Context.MODE_PRIVATE) }
+    val scope = rememberCoroutineScope()
     var showEditDialog by remember { mutableStateOf(false) }
+    var editingChapter by remember { mutableStateOf<ComicChapter?>(null) }
     val hasLocalChapters = book.chapters.isNotEmpty()
     val hasExternalUrl = metadata.externalUrl.isNotBlank()
     val isExternalOnly = metadata.openExternally && !hasLocalChapters
@@ -1058,6 +1061,7 @@ internal fun BookDetailScreen(
                 }
                 itemsIndexed(book.chapters, key = { _, chapter -> chapter.id }) { index, chapter ->
                     var isChapterPressed by remember(chapter.id) { mutableStateOf(false) }
+                    val canRenameChapter = !(chapter.id.endsWith("#root") && chapter.sourceUri == book.uri)
                     val chapterPressScale by animateFloatAsState(
                         targetValue = if (isChapterPressed) 0.97f else 1f,
                         label = "chapterRowPressScale"
@@ -1077,6 +1081,13 @@ internal fun BookDetailScreen(
                                             tryAwaitRelease()
                                         } finally {
                                             isChapterPressed = false
+                                        }
+                                    },
+                                    onLongPress = {
+                                        if (canRenameChapter) {
+                                            editingChapter = chapter
+                                        } else {
+                                            Toast.makeText(context, "该章节使用漫画根目录，不能在这里重命名", Toast.LENGTH_SHORT).show()
                                         }
                                     },
                                     onTap = { onReadChapter(index) }
@@ -1142,6 +1153,66 @@ internal fun BookDetailScreen(
             )
         }
     }
+
+    editingChapter?.let { chapter ->
+        RenameChapterDialog(
+            chapter = chapter,
+            onDismiss = { editingChapter = null },
+            onSaved = { newName ->
+                scope.launch {
+                    val renamed = try {
+                        onRenameChapter(chapter, newName)
+                    } catch (_: Exception) {
+                        false
+                    }
+                    editingChapter = null
+                    Toast.makeText(
+                        context,
+                        if (renamed) "章节已重命名" else "重命名失败，请检查名称或目录权限",
+                        Toast.LENGTH_SHORT
+                    ).show()
+                }
+            }
+        )
+    }
+}
+
+@Composable
+private fun RenameChapterDialog(
+    chapter: ComicChapter,
+    onDismiss: () -> Unit,
+    onSaved: (String) -> Unit
+) {
+    var inputName by remember(chapter.id) { mutableStateOf(chapter.name) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("修改章节名称") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                TextField(
+                    value = inputName,
+                    onValueChange = { inputName = it },
+                    label = { Text("章节名称") },
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Text("文件夹或压缩包名称会同步修改。", color = Color.Gray, fontSize = 12.sp)
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = {
+                    val newName = inputName.trim()
+                    if (newName.isNotBlank()) {
+                        onSaved(newName)
+                    }
+                }
+            ) { Text("保存") }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("取消") }
+        }
+    )
 }
 
 @Composable
@@ -1160,6 +1231,14 @@ private fun EditBookMetadataDialog(
     var inputCoverPage by remember { mutableStateOf(initialMetadata.coverPage.toString()) }
     var autoNextChapter by remember { mutableStateOf(initialMetadata.autoNextChapter) }
     var inputExternalUrl by remember { mutableStateOf(initialMetadata.externalUrl) }
+    var inputCoverUri by remember { mutableStateOf(initialMetadata.customCoverUri) }
+    val imagePicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) {
+            saveCoverToAppStorage(context, uri)?.let { storedUri ->
+                inputCoverUri = storedUri
+            } ?: Toast.makeText(context, "封面保存失败，请重新选择图片", Toast.LENGTH_SHORT).show()
+        }
+    }
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -1170,6 +1249,23 @@ private fun EditBookMetadataDialog(
                 TextField(value = inputDesc, onValueChange = { inputDesc = it }, label = { Text("简介") }, modifier = Modifier.fillMaxWidth())
                 TextField(value = inputTags, onValueChange = { inputTags = it }, label = { Text("标签，使用逗号分隔") }, modifier = Modifier.fillMaxWidth())
                 TextField(value = inputCoverPage, onValueChange = { inputCoverPage = it }, label = { Text("封面页码") }, modifier = Modifier.fillMaxWidth())
+                Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF1B1B25)), border = BorderStroke(1.dp, Color(0xFF303041))) {
+                    Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text("自定义封面", color = Color.White, fontWeight = FontWeight.Bold)
+                        Text(
+                            text = if (inputCoverUri.isBlank()) "未选择封面图，将使用封面页码。" else inputCoverUri,
+                            color = Color(0xFFC6C6D4),
+                            fontSize = 12.sp,
+                            lineHeight = 18.sp
+                        )
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            OutlinedButton(onClick = { imagePicker.launch(arrayOf("image/*")) }) { Text("选择图片") }
+                            if (inputCoverUri.isNotBlank()) {
+                                OutlinedButton(onClick = { inputCoverUri = "" }) { Text("清除") }
+                            }
+                        }
+                    }
+                }
                 TextField(
                     value = inputExternalUrl,
                     onValueChange = { inputExternalUrl = it },
@@ -1211,6 +1307,7 @@ private fun EditBookMetadataDialog(
                         putBoolean("${book.id}_external_only", false)
                         putBoolean("${book.id}_open_externally", false)
                         putString("${book.id}_external_url", externalUrl)
+                        putString("${book.id}_custom_cover_uri", inputCoverUri.trim())
                     }
                     onSaved()
                 }

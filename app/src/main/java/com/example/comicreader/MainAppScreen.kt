@@ -8,6 +8,7 @@ import android.content.SharedPreferences
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.Uri
+import android.provider.DocumentsContract
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -166,6 +167,8 @@ internal fun MainAppScreen() {
         }
         selectedBook = selectedBook?.takeIf { current ->
             bookshelf.any { it.id == current.id }
+        }?.let { current ->
+            bookshelf.firstOrNull { it.id == current.id } ?: current
         }
     }
 
@@ -193,6 +196,13 @@ internal fun MainAppScreen() {
             onEditFinished = {
                 selectedBook?.let(::syncBookAssetsLater)
                 refreshBookshelf(rescanLocal = false)
+            },
+            onRenameChapter = { chapter, newName ->
+                val renamed = renameComicChapter(context, sharedPrefs, selectedBook!!, chapter, newName)
+                if (renamed) {
+                    refreshBookshelf(rescanLocal = true)
+                }
+                renamed
             },
             onReadChapter = { chapterIndex ->
                 currentReaderSession = ReaderSession(selectedBook!!, chapterIndex)
@@ -550,6 +560,93 @@ internal fun saveCoverToAppStorage(context: Context, sourceUri: Uri): String? {
     }
 }
 
+private suspend fun renameComicChapter(
+    context: Context,
+    sharedPrefs: SharedPreferences,
+    book: ComicBook,
+    chapter: ComicChapter,
+    newName: String
+): Boolean = withContext(Dispatchers.IO) {
+    try {
+        if (newName.isBlank()) return@withContext false
+        if (chapter.id.endsWith("#root") && chapter.sourceUri == book.uri) return@withContext false
+
+        val chapterDocument = DocumentFile.fromSingleUri(context, chapter.sourceUri)
+            ?: findChapterDocumentInBook(context, book, chapter)
+            ?: return@withContext false
+        val sanitizedName = sanitizeChapterDocumentName(newName, chapter)
+        if (sanitizedName == chapterDocument.name) return@withContext true
+
+        val oldChapterId = chapter.id
+        val oldProgress = sharedPrefs.getInt(oldChapterId, -1)
+        val oldLastChapterId = sharedPrefs.getString("${book.id}_last_chapter_id", null)
+        val renamedUri = renameChapterDocument(context, book, chapter, chapterDocument, sanitizedName)
+        if (renamedUri != null) {
+            val newChapterId = renamedUri.toString()
+            sharedPrefs.edit {
+                if (oldProgress >= 0) {
+                    putInt(newChapterId, oldProgress)
+                    remove(oldChapterId)
+                }
+                if (oldLastChapterId == oldChapterId) {
+                    putString("${book.id}_last_chapter_id", newChapterId)
+                }
+                remove("${book.id}_asset_sync_signature")
+            }
+        }
+        renamedUri != null
+    } catch (_: Exception) {
+        false
+    }
+}
+
+private fun renameChapterDocument(
+    context: Context,
+    book: ComicBook,
+    chapter: ComicChapter,
+    chapterDocument: DocumentFile,
+    sanitizedName: String
+): Uri? {
+    try {
+        DocumentsContract.renameDocument(context.contentResolver, chapter.sourceUri, sanitizedName)?.let { renamedUri ->
+            return renamedUri
+        }
+    } catch (_: Exception) {
+    }
+
+    try {
+        if (chapterDocument.renameTo(sanitizedName)) {
+            return findRenamedChapterUri(context, book, sanitizedName) ?: chapterDocument.uri
+        }
+    } catch (_: Exception) {
+    }
+
+    val fallbackDocument = findChapterDocumentInBook(context, book, chapter) ?: return null
+    return try {
+        if (fallbackDocument.renameTo(sanitizedName)) {
+            findRenamedChapterUri(context, book, sanitizedName) ?: fallbackDocument.uri
+        } else {
+            null
+        }
+    } catch (_: Exception) {
+        null
+    }
+}
+
+private fun findChapterDocumentInBook(context: Context, book: ComicBook, chapter: ComicChapter): DocumentFile? {
+    val bookDocument = DocumentFile.fromSingleUri(context, book.uri) ?: return null
+    return bookDocument.listFiles().firstOrNull { candidate ->
+        candidate.uri == chapter.sourceUri || candidate.name == chapter.name
+    }
+}
+
+private fun findRenamedChapterUri(context: Context, book: ComicBook, renamedName: String): Uri? {
+    val bookDocument = DocumentFile.fromSingleUri(context, book.uri) ?: return null
+    return bookDocument.listFiles().firstOrNull { candidate ->
+        candidate.name == renamedName
+    }?.uri
+}
+
 internal fun saveWebsiteIconToAppStorage(context: Context, sourceUri: Uri): String? {
     return try {
         val iconDirectory = File(context.filesDir, "website_icons").apply { mkdirs() }
@@ -752,6 +849,20 @@ private fun prepareChildFile(directory: DocumentFile, fileName: String, mimeType
 private fun sanitizeDocumentName(rawName: String): String {
     val cleaned = rawName.replace(Regex("[\\\\/:*?\"<>|]"), "_").trim()
     return cleaned.ifBlank { "未命名漫画" }
+}
+
+private fun sanitizeChapterDocumentName(rawName: String, chapter: ComicChapter): String {
+    val cleaned = rawName.replace(Regex("[\\\\/:*?\"<>|]"), "_").trim().ifBlank { chapter.name }
+    if (!chapter.isZip) return cleaned
+
+    val currentExtension = chapter.name.substringAfterLast('.', missingDelimiterValue = "")
+        .takeIf { it.equals("zip", ignoreCase = true) || it.equals("cbz", ignoreCase = true) }
+        ?: chapter.sourceUri.lastPathSegment?.substringAfterLast('.', missingDelimiterValue = "")
+            ?.takeIf { it.equals("zip", ignoreCase = true) || it.equals("cbz", ignoreCase = true) }
+    if (currentExtension == null || cleaned.endsWith(".$currentExtension", ignoreCase = true)) {
+        return cleaned
+    }
+    return "$cleaned.$currentExtension"
 }
 
 internal fun isValidExternalUrl(url: String): Boolean {

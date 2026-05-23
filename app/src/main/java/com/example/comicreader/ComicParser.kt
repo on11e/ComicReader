@@ -12,6 +12,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileOutputStream
+import java.math.BigInteger
 import java.util.zip.ZipFile
 
 data class ComicChapter(
@@ -79,10 +80,10 @@ object ComicParser {
         if (!entry.isDirectory) return null
 
         val children = entry.listFiles()
-        val directImageFiles = children.filter(::isImageFile)
+        val directImageFiles = children.filter(::isComicPageImageFile)
         val childChapterCandidates = children
             .filter { child -> child.isDirectory || isArchiveFile(child.name) }
-            .sortedBy { it.name?.lowercase() ?: "" }
+            .sortedWith(compareByNaturalName { it.name.orEmpty() })
         if (shouldIgnoreGeneratedMetadataFolder(children, directImageFiles, childChapterCandidates)) return null
 
         val chapters = mutableListOf<ComicChapter>()
@@ -123,7 +124,7 @@ object ComicParser {
         }
 
         if (!entry.isDirectory) return null
-        if (!entry.listFiles().any(::isImageFile)) return null
+        if (!entry.listFiles().any(::isComicPageImageFile)) return null
 
         return ComicChapter(
             id = entry.uri.toString(),
@@ -222,9 +223,9 @@ object ComicParser {
         }
 
         val pages = directory.listFiles()
-            .filter(::isImageFile)
+            .filter(::isComicPageImageFile)
+            .sortedWith(compareByNaturalName { it.name.orEmpty() })
             .map { it.uri }
-            .sortedBy { it.toString().lowercase() }
 
         synchronized(pageListCacheLock) {
             folderPageListCache[cacheKey] = pages
@@ -265,7 +266,7 @@ object ComicParser {
                 zip.entries().toList()
                     .filter { entry -> !entry.isDirectory && isImageName(entry.name) }
                     .map { it.name }
-                    .sortedBy { it.lowercase() }
+                    .sortedWith(::compareNatural)
             }
 
             synchronized(pageListCacheLock) {
@@ -439,8 +440,51 @@ object ComicParser {
         return isImageName(file.name)
     }
 
+    private fun isComicPageImageFile(file: DocumentFile): Boolean {
+        if (!isImageFile(file)) return false
+        return !isGeneratedMetadataImageName(file.name)
+    }
+
     private fun isImageName(name: String?): Boolean {
         val lowered = name?.lowercase() ?: return false
         return lowered.endsWith(".jpg") || lowered.endsWith(".jpeg") || lowered.endsWith(".png") || lowered.endsWith(".webp")
+    }
+
+    private fun isGeneratedMetadataImageName(name: String?): Boolean {
+        return name.equals("cover.jpg", ignoreCase = true) ||
+            name.equals("cover.jpeg", ignoreCase = true) ||
+            name.equals("cover.png", ignoreCase = true) ||
+            name.equals("cover.webp", ignoreCase = true)
+    }
+
+    private fun <T> compareByNaturalName(selector: (T) -> String): Comparator<T> {
+        return Comparator { left, right -> compareNatural(selector(left), selector(right)) }
+    }
+
+    private fun compareNatural(left: String, right: String): Int {
+        var leftIndex = 0
+        var rightIndex = 0
+        while (leftIndex < left.length && rightIndex < right.length) {
+            val leftChar = left[leftIndex]
+            val rightChar = right[rightIndex]
+            if (leftChar.isDigit() && rightChar.isDigit()) {
+                val leftStart = leftIndex
+                val rightStart = rightIndex
+                while (leftIndex < left.length && left[leftIndex].isDigit()) leftIndex++
+                while (rightIndex < right.length && right[rightIndex].isDigit()) rightIndex++
+                val leftNumber = left.substring(leftStart, leftIndex).trimStart('0').ifEmpty { "0" }
+                val rightNumber = right.substring(rightStart, rightIndex).trimStart('0').ifEmpty { "0" }
+                val numberCompare = BigInteger(leftNumber).compareTo(BigInteger(rightNumber))
+                if (numberCompare != 0) return numberCompare
+                val digitLengthCompare = (leftIndex - leftStart).compareTo(rightIndex - rightStart)
+                if (digitLengthCompare != 0) return digitLengthCompare
+            } else {
+                val charCompare = leftChar.lowercaseChar().compareTo(rightChar.lowercaseChar())
+                if (charCompare != 0) return charCompare
+                leftIndex++
+                rightIndex++
+            }
+        }
+        return (left.length - leftIndex).compareTo(right.length - rightIndex)
     }
 }
