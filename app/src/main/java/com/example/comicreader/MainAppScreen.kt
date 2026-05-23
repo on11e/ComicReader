@@ -194,8 +194,17 @@ internal fun MainAppScreen() {
             metadata = metadataMap[selectedBook!!.id] ?: readBookMetadata(sharedPrefs, selectedBook!!),
             onBack = { selectedBook = null },
             onEditFinished = {
-                selectedBook?.let(::syncBookAssetsLater)
-                refreshBookshelf(rescanLocal = false)
+                selectedBook?.let { book ->
+                    scope.launch {
+                        val metadata = readBookMetadata(sharedPrefs, book)
+                        val renamedBookId = renameComicBookDocument(context, sharedPrefs, book, metadata.customName)
+                        if (renamedBookId == null) {
+                            Toast.makeText(context, "漫画重命名失败，请检查目录权限", Toast.LENGTH_SHORT).show()
+                        }
+                        selectedBook = null
+                        refreshBookshelf(rescanLocal = true)
+                    }
+                } ?: refreshBookshelf(rescanLocal = true)
             },
             onRenameChapter = { chapter, newName ->
                 val renamed = renameComicChapter(context, sharedPrefs, selectedBook!!, chapter, newName)
@@ -221,8 +230,14 @@ internal fun MainAppScreen() {
                 selectedBook = book
             },
             onRefreshMetadata = { book ->
-                syncBookAssetsLater(book)
-                refreshBookshelf(rescanLocal = false)
+                scope.launch {
+                    val metadata = readBookMetadata(sharedPrefs, book)
+                    val renamedBookId = renameComicBookDocument(context, sharedPrefs, book, metadata.customName)
+                    if (renamedBookId == null) {
+                        Toast.makeText(context, "漫画重命名失败，请检查目录权限", Toast.LENGTH_SHORT).show()
+                    }
+                    refreshBookshelf(rescanLocal = true)
+                }
             },
             onDeleteBook = { book ->
                 val deleted = deleteComicBook(context, sharedPrefs, book)
@@ -545,6 +560,98 @@ private fun clearBookMetadata(sharedPrefs: SharedPreferences, bookId: String) {
     }
 }
 
+internal suspend fun renameComicBookDocument(
+    context: Context,
+    sharedPrefs: SharedPreferences,
+    book: ComicBook,
+    newName: String
+): String? = withContext(Dispatchers.IO) {
+    try {
+        if (isExternalBookId(book.id)) return@withContext book.id
+        val bookDocument = DocumentFile.fromSingleUri(context, book.uri) ?: return@withContext null
+        val sanitizedName = sanitizeBookDocumentName(newName, book)
+        if (sanitizedName == bookDocument.name) return@withContext book.id
+
+        val renamedUri = renameBookDocument(context, bookDocument, book.uri, sanitizedName)
+            ?: return@withContext null
+        val newBookId = renamedUri.toString()
+        if (newBookId != book.id) {
+            migrateBookMetadata(sharedPrefs, book.id, newBookId)
+            migrateBookCaches(context, book.id, newBookId)
+        }
+        newBookId
+    } catch (_: Exception) {
+        null
+    }
+}
+
+private fun renameBookDocument(
+    context: Context,
+    bookDocument: DocumentFile,
+    bookUri: Uri,
+    sanitizedName: String
+): Uri? {
+    try {
+        DocumentsContract.renameDocument(context.contentResolver, bookUri, sanitizedName)?.let { renamedUri ->
+            return renamedUri
+        }
+    } catch (_: Exception) {
+    }
+
+    return try {
+        if (bookDocument.renameTo(sanitizedName)) bookDocument.uri else null
+    } catch (_: Exception) {
+        null
+    }
+}
+
+private fun migrateBookMetadata(sharedPrefs: SharedPreferences, oldBookId: String, newBookId: String) {
+    val suffixes = listOf(
+        "_custom_name",
+        "_custom_desc",
+        "_tags",
+        "_cover_index",
+        "_auto_next",
+        "_external_only",
+        "_open_externally",
+        "_external_url",
+        "_custom_cover_uri",
+        "_last_chapter_id",
+        "_asset_sync_signature"
+    )
+    val allValues = sharedPrefs.all
+    sharedPrefs.edit {
+        suffixes.forEach { suffix ->
+            val oldKey = oldBookId + suffix
+            val newKey = newBookId + suffix
+            when (val value = allValues[oldKey]) {
+                is String -> putString(newKey, value)
+                is Int -> putInt(newKey, value)
+                is Boolean -> putBoolean(newKey, value)
+                is Long -> putLong(newKey, value)
+                is Float -> putFloat(newKey, value)
+            }
+            remove(oldKey)
+        }
+    }
+}
+
+private fun migrateBookCaches(context: Context, oldBookId: String, newBookId: String) {
+    val oldThumbPrefix = "thumb_${oldBookId.hashCode()}_v"
+    val newThumbPrefix = "thumb_${newBookId.hashCode()}_v"
+    context.filesDir.listFiles()
+        ?.filter { file -> file.isFile && file.name.startsWith(oldThumbPrefix) }
+        ?.forEach { oldFile ->
+            val newFileName = oldFile.name.replaceFirst(oldThumbPrefix, newThumbPrefix)
+            val newFile = File(context.filesDir, newFileName)
+            if (newFile.exists()) return@forEach
+            try {
+                oldFile.copyTo(newFile, overwrite = false)
+            } catch (_: Exception) {
+            }
+        }
+}
+
 internal fun saveCoverToAppStorage(context: Context, sourceUri: Uri): String? {
     return try {
         val coverDirectory = File(context.filesDir, "external_covers").apply { mkdirs() }
@@ -747,9 +854,8 @@ private suspend fun syncSingleBookAssets(
     val syncKey = "${book.id}_asset_sync_signature"
     if (sharedPrefs.getString(syncKey, null) == syncSignature) return
 
-    val folderName = sanitizeDocumentName(metadata.customName.ifBlank { book.name })
-    val bookDirectory = rootDirectory.findFile(folderName)?.takeIf { it.isDirectory }
-        ?: rootDirectory.createDirectory(folderName)
+    val bookDirectory = DocumentFile.fromSingleUri(context, book.uri)?.takeIf { it.isDirectory }
+        ?: rootDirectory.findFile(book.name)?.takeIf { it.isDirectory }
         ?: return
 
     if (metadata.externalUrl.isNotBlank()) {
@@ -849,6 +955,18 @@ private fun prepareChildFile(directory: DocumentFile, fileName: String, mimeType
 private fun sanitizeDocumentName(rawName: String): String {
     val cleaned = rawName.replace(Regex("[\\\\/:*?\"<>|]"), "_").trim()
     return cleaned.ifBlank { "未命名漫画" }
+}
+
+private fun sanitizeBookDocumentName(rawName: String, book: ComicBook): String {
+    val cleaned = sanitizeDocumentName(rawName).ifBlank { book.name }
+    val currentExtension = book.name.substringAfterLast('.', missingDelimiterValue = "")
+        .takeIf { book.chapters.size == 1 && (it.equals("zip", ignoreCase = true) || it.equals("cbz", ignoreCase = true)) }
+        ?: book.uri.lastPathSegment?.substringAfterLast('.', missingDelimiterValue = "")
+            ?.takeIf { it.equals("zip", ignoreCase = true) || it.equals("cbz", ignoreCase = true) }
+    if (currentExtension == null || cleaned.endsWith(".$currentExtension", ignoreCase = true)) {
+        return cleaned
+    }
+    return "$cleaned.$currentExtension"
 }
 
 private fun sanitizeChapterDocumentName(rawName: String, chapter: ComicChapter): String {

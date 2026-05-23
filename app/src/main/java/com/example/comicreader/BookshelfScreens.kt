@@ -1296,8 +1296,7 @@ private fun BookDetailFixedContent(
             Column(
                 modifier = Modifier
                     .fillMaxWidth(0.82f)
-                    .weight(1f)
-                    .align(Alignment.CenterHorizontally),
+                    .weight(1f),
                 verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
             Row(
@@ -1313,11 +1312,14 @@ private fun BookDetailFixedContent(
                 )
                 Button(
                     onClick = onReadSelectedChapter,
-                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF6750A4)),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = Color(0xFFF2B84B),
+                        contentColor = Color(0xFF12121A)
+                    ),
                     shape = RoundedCornerShape(12.dp),
                     contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp)
                 ) {
-                    Text("阅读", color = Color.White, fontWeight = FontWeight.Bold)
+                    Text("阅读", color = Color(0xFF12121A), fontWeight = FontWeight.Bold)
                 }
             }
             Box(
