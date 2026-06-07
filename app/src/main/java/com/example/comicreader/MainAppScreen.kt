@@ -907,27 +907,71 @@ private suspend fun syncSingleBookAssets(
 
     val syncSignature = bookAssetSyncSignature(book, metadata)
     val syncKey = "${book.id}_asset_sync_signature"
-    if (sharedPrefs.getString(syncKey, null) == syncSignature) return
+    val previousSyncSignature = sharedPrefs.getString(syncKey, null)
+    if (previousSyncSignature == syncSignature) return
 
     val bookDirectory = DocumentFile.fromSingleUri(context, book.uri)?.takeIf { it.isDirectory }
         ?: rootDirectory.findFile(book.name)?.takeIf { it.isDirectory }
         ?: return
 
-    if (metadata.externalUrl.isNotBlank()) {
-        writeTextDocument(context, bookDirectory, "source_url.txt", metadata.externalUrl)
-    } else {
-        bookDirectory.findFile("source_url.txt")?.delete()
+    val canReuseSourceUrl = previousSyncSignature == null &&
+        existingSourceUrlMatches(context, bookDirectory, metadata.externalUrl)
+    val canReuseCover = previousSyncSignature == null && existingCoverCanBeReused(context, bookDirectory)
+    if (canReuseSourceUrl && canReuseCover) {
+        sharedPrefs.edit { putString(syncKey, syncSignature) }
+        return
     }
 
-    val coverBitmap = resolveBookCoverBitmap(context, book, metadata)
-    if (coverBitmap != null) {
-        writeBitmapDocument(context, bookDirectory, "cover.jpg", coverBitmap)
-        coverBitmap.recycle()
-    } else {
-        bookDirectory.findFile("cover.jpg")?.delete()
+    if (!canReuseSourceUrl) {
+        if (metadata.externalUrl.isNotBlank()) {
+            writeTextDocument(context, bookDirectory, "source_url.txt", metadata.externalUrl)
+        } else {
+            bookDirectory.findFile("source_url.txt")?.delete()
+        }
+    }
+
+    if (!canReuseCover) {
+        val coverBitmap = resolveBookCoverBitmap(context, book, metadata)
+        if (coverBitmap != null) {
+            writeBitmapDocument(context, bookDirectory, "cover.jpg", coverBitmap)
+            coverBitmap.recycle()
+        } else {
+            bookDirectory.findFile("cover.jpg")?.delete()
+        }
     }
 
     sharedPrefs.edit { putString(syncKey, syncSignature) }
+}
+
+private fun existingSourceUrlMatches(
+    context: Context,
+    bookDirectory: DocumentFile,
+    expectedUrl: String
+): Boolean {
+    val sourceUrlFile = bookDirectory.findFile("source_url.txt")?.takeIf { it.isFile }
+    if (expectedUrl.isBlank()) return sourceUrlFile == null
+    if (sourceUrlFile == null) return false
+
+    return try {
+        context.contentResolver.openInputStream(sourceUrlFile.uri)
+            ?.bufferedReader()
+            ?.use { reader -> reader.readText().trim() == expectedUrl.trim() } == true
+    } catch (_: Exception) {
+        false
+    }
+}
+
+private fun existingCoverCanBeReused(context: Context, bookDirectory: DocumentFile): Boolean {
+    val coverFile = bookDirectory.findFile("cover.jpg")?.takeIf { it.isFile } ?: return false
+    return try {
+        val options = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        context.contentResolver.openInputStream(coverFile.uri)?.use { inputStream ->
+            BitmapFactory.decodeStream(inputStream, null, options)
+        }
+        options.outWidth > 0 && options.outHeight > 0
+    } catch (_: Exception) {
+        false
+    }
 }
 
 private fun bookAssetSyncSignature(book: ComicBook, metadata: BookMetadata): String {
